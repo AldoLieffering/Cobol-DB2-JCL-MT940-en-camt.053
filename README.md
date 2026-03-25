@@ -3,7 +3,7 @@
 ## eigen project
 ## MT940
 Het doel dat ik mij gesteld had, was het maken van een job met twee programmas voor het verwerken van een electronisch rekeningafschrift MT940 dat een fictieve verzekeringsmaatschappij dagelijks van PostFinance ontvangt. Het dossier bevat:
-1. **Cobol programma BNQ0001R**: verwrking van een SWIFT bestand **MT940** (rekeningafschrift). Output: een tussenbestand, controle- en foutlijst. Lees-toegang tot **DB2**
+1. **Cobol programma BNQ0001R**: verwerking van een SWIFT bestand **MT940** (rekeningafschrift). Output: een tussenbestand, controle- en foutlijst. Lees-toegang tot **DB2**
 2. **Cobol programma BNQ0002W**: update van 2 **DB2** tabellen via **embedded SQL**. Invoer: tussenbestand, gesorteerd. Uitvoer: controle- en foutlijst.
 3. **Analyses**, broncode, compilaties **Cobol**, **SQL**, **JCL**, plus de **testresultaten**.
 
