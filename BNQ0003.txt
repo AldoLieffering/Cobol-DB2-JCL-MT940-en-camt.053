@@ -1,0 +1,447 @@
+      ******************************************************************
+      *                                                                *
+      *    Ce programme est une ébauche rapide.                        *
+      *    Elle se limite à la lecture d'un fichier camt.053 et la     *
+      *    transformation (imparfaite) des données de celui-ci pour    *
+      *    pouvoir être traité par le programme BNQ0002W               *
+      *                                                                *
+      *    Elle ne contient ni validations, ni gestion d'erreurs,      *
+      *    ni listes.                                                  *
+      ******************************************************************
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. BNQ0003.
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SPECIAL-NAMES.
+      *     DECIMAL-POINT IS COMMA.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT camt ASSIGN TO infile
+           FILE STATUS IS camt-status.
+
+           SELECT out-file ASSIGN TO outfile
+           FILE STATUS IS out-file-status.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  camt RECORDING MODE IS V
+           RECORD VARYING FROM 1 TO 300 DEPENDING ON ws-rec-length.
+       01  in-line.
+           05                          PIC X OCCURS 1 TO 300
+                                        DEPENDING ON ws-rec-length.
+
+      * fichier en sortie: header, lignes, footer pour maj BD
+       FD  out-file RECORDING MODE V
+                    RECORD VARYING FROM 37 TO 493.
+       01  out-header.
+           05 out-rec-number           PIC S9(4).
+           05 out-file-error-status    PIC X.
+           05 out-BIC                  PIC X(8).
+           05 out-IBAN                 PIC X(35).
+           05 out-type-message         PIC X(3).
+           05 out-reference-message    PIC X(16).
+           05 out-statement-number     PIC 9(5).
+           05 out-currency             PIC XXX.
+           05 out-date                 PIC X(10).
+           05 out-D-C-init             PIC X.
+           05 out-balance-init         PIC 9(12)V99.
+       01  out-line.
+           05                          PIC S9(4).
+           05 out-error-status         PIC X.
+           05 out-val-date             PIC X(10).
+           05 out-ent-date             PIC X(10).
+           05 out-D-C-detail           PIC X.
+           05 out-amount               PIC 9(12)V99.
+           05 out-reference            PIC X(16).
+           05 out-booking-ID           PIC X(16).
+           05 out-image-ID             PIC X(34).
+           05 out-booking-code         PIC X(4).
+           05 out-info                 PIC X(383).
+       01  out-footer.
+           05                          PIC S9(4).
+           05 out-date-file            PIC X(10).
+           05 out-D-C-final            PIC X.
+           05 out-balance              PIC 9(12)V99.
+           05 out-number-in-error      PIC 9(4).
+           05 out-number-processed     PIC 9(4).
+
+       WORKING-STORAGE SECTION.
+      * -- file info
+       01  ws-rec-length               PIC 9(4).
+       01  camt-status                 PIC 99.
+       01  out-file-status             PIC 99.
+
+      * -- switches
+       01.
+           05                          PIC X VALUE 'N'.
+              88 header-done           VALUE 'Y'.
+           05                          PIC X VALUE 'O'.
+              88 opening-balance       VALUE 'O'.
+              88 closing-balance       VALUE 'C'.
+
+      * table pour piloter les traitements selon les niveaux XML
+      * certains niveaux ne sont pas utils pour distinguer les
+      * données (88 mis en commentaire)
+       01.
+           05  table-levels.
+             10 level OCCURS 8.
+                15                       PIC x(15).
+           05  libelles REDEFINES table-levels.
+             10 level-1                  PIC X(15).
+      *         88 tag-document          VALUE 'Document       '.
+             10 level-2                  PIC X(15).
+      *         88 tag-bank-to-cust      VALUE 'BkToCstmrStmt  '.
+             10 level-3                  PIC X(15).
+                88 tag-statement         VALUE 'Stmt           '.
+                88 tag-3-empty           VALUE SPACE.
+             10 level-4                  PIC X(15).
+                88 tag-account           VALUE 'Acct           '.
+                88 tag-message-id        VALUE 'MsgId          '.
+                88 tag-sequence-nb       VALUE 'ElctrncSeqNb   '.
+                88 tag-balance           VALUE 'Bal            '.
+                88 tag-entry             VALUE 'Ntry           '.
+                88 tag-4-empty           VALUE SPACE.
+             10 level-5                  PIC X(15).
+                88 tag-id                VALUE 'Id             '.
+                88 tag-currency          VALUE 'Ccy            '.
+                88 tag-C-D               VALUE 'CdtDbtInd      '.
+                88 tag-type              VALUE 'Tp             '.
+                88 tag-valuta-date       VALUE 'ValDt          '.
+                88 tag-booking-date      VALUE 'BookgDt        '.
+                88 tag-entry-reference   VALUE 'NtryRef        '.
+                88 tag-account-serv-ref  VALUE 'AcctSvcrRef    '.
+                88 tag-bank-trans-code   VALUE 'BkTxCd         '.
+                88 tag-additional-info   VALUE 'AddtlNtryInf   '.
+                88 tag-date-5            VALUE 'Dt             '.
+                88 tag-amount            VALUE 'Amt            '.
+                88 tag-5-empty           VALUE SPACE.
+             10 level-6                  PIC X(15).
+                88 tag-IBAN              VALUE 'IBAN           '.
+                88 tag-code-or-prtry     VALUE 'CdOrPrtry      '.
+                88 tag-date-6            VALUE 'Dt             '.
+                88 tag-domain            VALUE 'Domn           '.
+             10 level-7                  PIC X(15).
+                88 tag-code-7            VALUE 'Cd             '.
+                88 tag-familly           VALUE 'Fmly           '.
+             10 level-8                  PIC X(15).
+                88 tag-code-8            VALUE 'Cd             '.
+                88 tag-sub-familly       VALUE 'SubFmlyCd      '.
+       01.
+           05 cnt-levels               PIC 9.
+           05 max-cnt                  PIC 9 VALUE 8.
+
+      * -- dates
+       01.
+           05 ws-current-date.
+              10 ws-current-yyyymmdd-x.
+                 15 ws-current-yyyy    PIC 9(4).
+                 15 ws-current-mm      PIC 99.
+                 15 ws-current-dd      PIC 99.
+              10 ws-current-yyyymmdd REDEFINES ws-current-yyyymmdd-x
+                                       PIC 9(8).
+              10 ws-current-time       PIC X(12).
+           05 ws-current-date-sql.
+              10 ws-current-yyyy-sql   PIC 9(4).
+              10 FILLER                PIC X VALUE '-'.
+              10 ws-current-mm-sql     PIC 99.
+              10 FILLER                PIC X VALUE '-'.
+              10 ws-current-dd-sql     PIC 99.
+
+      * -- ws valeurs pour listes et fichier en sortie
+       01  ws-header.
+           05 ws-rec-number            PIC S9(4).
+           05 ws-file-error-status     PIC X.
+           05 ws-BIC                   PIC X(8).
+           05 ws-IBAN                  PIC X(35).
+           05 ws-type-message          PIC X(3).
+           05 ws-reference-message     PIC X(16).
+           05 ws-statement-number      PIC 9(5).
+           05 ws-currency              PIC XXX.
+           05 ws-date                  PIC X(10).
+           05 ws-D-C-init              PIC X.
+           05 ws-balance-init          PIC 9(12)V99.
+       01  ws-line.
+           05 ws-error-status          PIC X.
+           05 ws-val-date              PIC X(10).
+           05 ws-ent-date              PIC X(10).
+           05 ws-D-C-detail            PIC X.
+           05 ws-amount                PIC 9(12)V99.
+           05 ws-reference             PIC X(16).
+           05 ws-booking-ID            PIC X(16).
+           05 ws-image-ID              PIC X(34).
+           05 ws-booking-code          PIC X(4).
+           05 ws-info                  PIC X(383).
+       01  ws-footer.
+           05 ws-date-file             PIC X(10).
+           05 ws-D-C-final             PIC X.
+           05 ws-balance               PIC 9(12)V99.
+           05 ws-number-in-error       PIC 9(4).
+           05 ws-number-processed      PIC 9(4).
+
+       PROCEDURE DIVISION.
+
+       0000-MAIN.
+           PERFORM 1000-INIT
+
+           PERFORM 2000-READ-CAMT
+
+           XML PARSE in-line PROCESSING PROCEDURE IS 7000-XML-PROC
+
+           PERFORM 9000-STOP
+
+           STOP RUN
+           .
+
+
+       1000-INIT.
+           OPEN INPUT camt
+           OPEN OUTPUT out-file
+
+           MOVE SPACE                  TO table-levels
+
+           ACCEPT ws-current-date FROM SYSIN
+           MOVE ws-current-dd           TO ws-current-dd-sql
+           MOVE ws-current-mm           TO ws-current-mm-sql
+           MOVE ws-current-yyyy         TO ws-current-yyyy-sql
+           .
+
+       1100-INIT-WS.
+           INITIALIZE ws-line
+           .
+
+       2000-READ-CAMT.
+           READ camt
+           .
+
+       3000-WRITE-HEADER.
+           WRITE out-header
+           .
+
+       3010-WRITE-LINE.
+           WRITE out-line
+           PERFORM 1100-INIT-WS
+           .
+
+       3020-WRITE-FOOTER.
+           WRITE out-footer
+           .
+
+       6000-PREPARE-HEADER.
+           MOVE -1                     TO out-rec-number
+           MOVE ws-file-error-status   TO out-file-error-status
+           MOVE ws-BIC                 TO out-BIC
+           MOVE ws-IBAN                TO out-IBAN
+           MOVE ws-type-message        TO out-type-message
+           MOVE ws-reference-message   TO out-reference-message
+           MOVE ws-statement-number    TO out-statement-number
+           MOVE ws-currency            TO out-currency
+           MOVE ws-date                TO out-date
+           MOVE ws-D-C-init            TO out-D-C-init
+           MOVE ws-balance-init        TO out-balance-init
+           .
+
+       6100-PREPARE-LINE.
+           ADD 1                       TO ws-rec-number
+           MOVE ws-rec-number          TO out-rec-number
+           MOVE ws-error-status        TO out-error-status
+           MOVE ws-val-date            TO out-val-date
+           MOVE ws-ent-date            TO out-ent-date
+           MOVE ws-D-C-detail          TO out-D-C-detail
+           MOVE ws-amount              TO out-amount
+           MOVE ws-reference           TO out-reference
+           MOVE ws-booking-ID          TO out-booking-ID
+           MOVE ws-image-ID            TO out-image-ID
+           MOVE ws-booking-code        TO out-booking-code
+           MOVE ws-info                TO out-info
+           .
+
+       6200-PREPARE-FOOTER.
+           MOVE ws-rec-number          TO ws-number-processed
+           MOVE 0                      TO ws-number-in-error
+           MOVE 0                      TO out-rec-number
+           MOVE ws-date-file           TO out-date-file
+           MOVE ws-D-C-final           TO out-D-C-final
+           MOVE ws-balance             TO out-balance
+           MOVE ws-number-in-error     TO out-number-in-error
+           MOVE ws-number-processed    TO out-number-processed
+           .
+
+       7000-XML-PROC.
+      *     display 'event : ' XML-EVENT ', text : ' XML-TEXT
+
+           EVALUATE XML-EVENT
+              WHEN 'END-OF-INPUT'
+                 PERFORM 2000-READ-CAMT
+
+                 EVALUATE camt-status
+                    WHEN 0
+                       MOVE 1          TO XML-CODE
+                    WHEN 10
+                       DISPLAY 'fin du fichier'
+                    WHEN OTHER
+                       DISPLAY 'erreur de lecture'
+                       GO TO 9999-ABEND
+                 END-EVALUATE
+              WHEN 'START-OF-ELEMENT'
+                 ADD 1                 TO cnt-levels
+                 IF cnt-levels > max-cnt
+                    GO TO 9999-ABEND
+                 END-IF
+                 MOVE XML-TEXT         TO level(cnt-levels)
+                 IF tag-entry AND NOT header-done THEN
+                    SET header-done    TO TRUE
+                    PERFORM 6000-PREPARE-HEADER
+                     PERFORM 8000-LISTE-HEADER
+                     PERFORM 3000-WRITE-HEADER
+                     MOVE ZERO         TO ws-rec-number
+                    CONTINUE
+                 END-IF
+
+              WHEN 'END-OF-ELEMENT'
+                 EVALUATE TRUE
+                    WHEN tag-entry AND tag-5-empty
+                        PERFORM 6100-PREPARE-LINE
+                        PERFORM 8100-LISTE-DETAIL
+                        PERFORM 3010-WRITE-LINE
+                       CONTINUE
+                    WHEN tag-statement AND tag-4-empty
+                       PERFORM 6200-PREPARE-FOOTER
+                        PERFORM 8200-LISTE-FOOTER
+                        PERFORM 3020-WRITE-FOOTER
+                    WHEN OTHER
+                       CONTINUE
+                 END-EVALUATE
+                 MOVE SPACE            TO level(cnt-levels)
+                 SUBTRACT 1            FROM cnt-levels
+
+
+              WHEN 'CONTENT-CHARACTERS'
+                 PERFORM 7100-FEED-WS
+
+              WHEN OTHER
+                 CONTINUE
+           END-EVALUATE
+           .
+
+       7100-FEED-WS.
+      * -- valeurs constantes - provisoirement
+           MOVE 'T'                    TO ws-error-status
+                                          ws-file-error-status
+           MOVE 'POFICHB0'             TO ws-BIC
+           MOVE 'C53'                  TO ws-type-message
+           MOVE ws-current-date-sql    TO ws-date
+           MOVE SPACE                  TO ws-image-ID
+
+           EVALUATE TRUE
+      * -- header
+      *    IBAN
+              WHEN tag-IBAN
+                 MOVE XML-TEXT         TO ws-IBAN
+      *    reference message: tronqué
+              WHEN tag-message-id
+                 MOVE XML-TEXT(1:16)   TO ws-reference-message
+      *    numéro de relevé
+              WHEN tag-sequence-nb
+                 MOVE XML-TEXT         TO ws-statement-number
+      *    valuta
+              WHEN tag-account AND tag-currency
+                 MOVE XML-TEXT         TO ws-currency
+      *    solde: déterminer type de solde
+              WHEN tag-balance AND tag-type AND tag-code-or-prtry AND
+                   tag-code-7 AND XML-TEXT = 'OPBD'
+                 SET opening-balance   TO TRUE
+              WHEN tag-balance AND tag-type AND tag-code-or-prtry AND
+                   tag-code-7 AND XML-TEXT = 'CLBD'
+                 SET closing-balance   TO TRUE
+      *    solde initial
+              WHEN tag-balance AND tag-C-D AND opening-balance
+                 MOVE XML-TEXT (1:1)   TO ws-D-C-init
+              WHEN tag-balance AND tag-amount AND opening-balance
+                 COMPUTE ws-balance-init = FUNCTION NUMVAL (XML-TEXT)
+      * -- footer
+      *    solde final
+              WHEN tag-balance AND tag-C-D AND closing-balance
+                 MOVE XML-TEXT (1:1)   TO ws-D-C-final
+              WHEN tag-balance AND tag-amount AND closing-balance
+                 COMPUTE ws-balance = FUNCTION NUMVAL (XML-TEXT)
+              WHEN tag-balance AND tag-date-5 AND tag-date-6 AND
+                                                       closing-balance
+                 MOVE XML-TEXT         TO ws-date-file
+      * -- line
+      *    date valeur
+              WHEN tag-valuta-date AND tag-date-6
+                 MOVE XML-TEXT         TO ws-val-date
+      *    date comptable
+              WHEN tag-booking-date AND tag-date-6
+                 MOVE XML-TEXT         TO ws-ent-date
+      *    débit-crédit
+              WHEN tag-entry AND tag-C-D
+                 MOVE XML-TEXT (1:1)   TO ws-D-C-detail
+      *    montant
+              WHEN tag-entry AND tag-amount
+                 COMPUTE ws-amount = FUNCTION NUMVAL (XML-TEXT)
+      *    référence
+              WHEN tag-entry-reference
+                 MOVE XML-TEXT         TO ws-reference
+      *    ID comptable
+              WHEN tag-account-serv-ref
+                 MOVE XML-TEXT         TO ws-booking-ID
+      *    code comptable (tronqué)
+              WHEN tag-bank-trans-code AND tag-domain AND tag-code-7
+                 MOVE XML-TEXT         TO ws-booking-code
+      *    informations
+              WHEN tag-additional-info
+                 MOVE XML-TEXT         TO ws-info
+              WHEN OTHER
+                 CONTINUE
+           END-EVALUATE
+           .
+
+
+       8000-LISTE-HEADER.
+           DISPLAY 'header'
+           DISPLAY 'rec-number :           ' ws-rec-number
+           DISPLAY 'file-error-status :    ' ws-file-error-status
+           DISPLAY 'BIC :                  ' ws-BIC
+           DISPLAY 'IBAN :                 ' ws-IBAN
+           DISPLAY 'Type-message :         ' ws-type-message
+           DISPLAY 'reference-message :    ' ws-reference-message
+           DISPLAY 'statement-number :     ' ws-statement-number
+           DISPLAY 'currency :             ' ws-currency
+           DISPLAY 'date :                 ' ws-date
+           DISPLAY 'D-C-init :             ' ws-D-C-init
+           DISPLAY 'balance-init :         ' ws-balance-init
+           .
+
+       8100-LISTE-DETAIL.
+           DISPLAY 'line'
+           DISPLAY 'error-status :         ' ws-error-status
+           DISPLAY 'val-date :             ' ws-val-date
+           DISPLAY 'ent-date :             ' ws-ent-date
+           DISPLAY 'D-C-detail :           ' ws-D-C-detail
+           DISPLAY 'amount :               ' ws-amount
+           DISPLAY 'reference :            ' ws-reference
+           DISPLAY 'booking-ID :           ' ws-booking-ID
+           DISPLAY 'image-ID :             ' ws-image-ID
+           DISPLAY 'booking-code :         ' ws-booking-code
+           DISPLAY 'info :                 ' ws-info
+           .
+
+       8200-LISTE-FOOTER.
+           DISPLAY 'footer'
+           DISPLAY 'date-file :            ' ws-date-file
+           DISPLAY 'D-C-final :            ' ws-D-C-final
+           DISPLAY 'balance :              ' ws-balance
+           DISPLAY 'number-in-error :      ' ws-number-in-error
+           DISPLAY 'number-processed :     ' ws-number-processed
+           .
+
+       9000-STOP.
+           CLOSE camt
+           CLOSE out-file
+           .
+
+       9999-ABEND.
+           MOVE 12                     TO RETURN-CODE
+           STOP RUN.

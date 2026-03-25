@@ -1,0 +1,991 @@
+      *
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. BN0002W.
+       AUTHOR. Aldo Lieffering.
+       DATE-WRITTEN. Mars 2026.
+
+      ******************************************************************
+      *    Ce programme fait partie d'un projet personnel pour montrer *
+      *               mes compétences Cobol, JCL et DB2.               *
+      ******************************************************************
+      **                                                              **
+      **   Ce programme met à jour la base de données en fonction     **
+      **   des inputs du programme précédent                          **
+      **   Il n'y a pas de traitements à proprement parler, sauf la   **
+      **   mise-à-jour du statut d'erreur de Relevé en cas d'erreurs  **
+      **   de mis-à-jour de la base                                   **
+      **                                                              **
+      **   INPUT:                                                     **
+      **   - fichier de relevé bancaire préparé par programme précédent*
+      **                                                              **
+      **   ACCES Base de données:                                     **
+      **   - INSERT et UPDATE relevé (table Z88751tA)                 **
+      **   - INSERT écriture (table Z88751TB)                         **
+      **   OUPUT:                                                     **
+      **   - liste des erreurs.                                       **
+      **   - rapport de contrôle                                      **
+      **                                                              **
+      ******************************************************************
+      ******************************************************************
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SPECIAL-NAMES.
+           DECIMAL-POINT IS COMMA.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+      * fichier intermédiaire
+           SELECT intermed ASSIGN TO intermed
+           FILE STATUS IS intermed-file-status.
+      * liste de contrôle
+           SELECT liste-controle ASSIGN TO lstcntrl
+           FILE STATUS IS controle-file-status.
+      * liste d'erreurs
+           SELECT error-list ASSIGN TO errlst
+           FILE STATUS IS error-file-status.
+
+       DATA DIVISION.
+       FILE SECTION.
+      * fichier en entrée intermédiaire: données de l'extrait de compte
+       FD  intermed RECORDING MODE V
+                    RECORD VARYING FROM 37 TO 493.
+       01  in-header.
+           05 in-rec-number           PIC S9(4).
+           05 in-file-error-status    PIC X.
+           05 in-BIC                  PIC X(8).
+           05 in-IBAN                 PIC X(35).
+           05 in-type-message         PIC X(3).
+           05 in-reference-message    PIC X(16).
+           05 in-statement-number     PIC 9(5).
+           05 in-currency             PIC XXX.
+           05 in-date                 PIC X(10).
+           05 in-D-C-init             PIC X.
+           05 in-solde-init           PIC 9(12)V99.
+       01  in-line.
+           05                         PIC S9(4).
+           05 in-error-status         PIC X.
+           05 in-val-date             PIC X(10).
+           05 in-ent-date             PIC X(10).
+           05 in-D-C-detail           PIC X.
+           05 in-amount               PIC 9(12)V99.
+           05 in-reference            PIC X(16).
+           05 in-booking-ID           PIC X(16).
+           05 in-image-ID             PIC X(34).
+           05 in-booking-code         PIC X(4).
+           05 in-info                 PIC X(383).
+       01  in-footer.
+           05                         PIC S9(4).
+           05 in-date-file            PIC X(10).
+           05 in-D-C-final            PIC X.
+           05 in-balance              PIC 9(12)V99.
+           05 in-number-in-error      PIC 9(4).
+           05 in-number-processed     PIC 9(4).
+
+
+      * liste de controle
+       FD  liste-controle RECORDING MODE IS F.
+       01  rap-compt-rec               PIC X(120).
+
+      * liste des erreurs
+       FD  error-list RECORDING MODE IS F.
+       01  error-rec                   PIC X(120).
+
+       WORKING-STORAGE SECTION.
+      *******************************************************
+      * File status                                         *
+      *******************************************************
+       01  controle-file-status        PIC XX.
+         88 controle-ok                 VALUE '00'.
+       01  error-file-status           PIC XX.
+         88 error-ok                   VALUE '00'.
+       01  intermed-file-status        PIC XX.
+         88 intermed-ok                VALUE '00'.
+         88 intermed-eof               VALUE '10'.
+
+      *******************************************************
+      *  switches                                           *
+      *******************************************************
+       01  errors                      PIC X VALUE 'N'.
+         88 errors-occurred            VALUE 'Y'.
+         88 no-errors                  VALUE 'N'.
+       01  error-releve                PIC X VALUE 'N'.
+         88 fatal-error                VALUE 'Y'.
+
+      *******************************************************
+      *  compteurs, champs intermédiaires, constantes       *
+      *******************************************************
+       01.
+           05 cnt                      PIC 99.
+           05 cnt-total                PIC 9(4).
+           05 cnt-lines                PIC 9(4).
+           05 cnt-inserted             PIC S9(9) COMP.
+           05 ws-nb-to-insert          PIC S9(9) COMP.
+           05 cnt-to-process           PIC 9(4).
+           05 cnt-error-lines          PIC 9(4).
+           05 cnt-errors               PIC S9(9) COMP.
+           05 ws-comptabilise          PIC X VALUE 'N'.
+           05 ws-length                PIC 9(9).
+           05 ws-zero                  PIC S9(9) VALUE ZERO COMP.
+           05 ws-return-code           PIC 9(4).
+
+      *******************************************************
+      *  dates                                              *
+      *******************************************************
+       01  dates.
+           05 ws-current-date.
+              10 ws-current-yyyy       PIC 9(4).
+              10 ws-current-mm         PIC 99.
+              10 ws-current-dd         PIC 99.
+              10 ws-current-time       PIC X(12).
+           05 ws-current-date-display.
+              10 ws-current-dd-display PIC 99.
+              10 FILLER                PIC X VALUE '/'.
+              10 ws-current-mm-display PIC 99.
+              10 FILLER                PIC X VALUE '/'.
+              10 ws-current-yyyy-display PIC 9(4).
+           05 ws-current-date-sql.
+              10 ws-current-yyyy-sql   PIC 9(4).
+              10 FILLER                PIC X VALUE '-'.
+              10 ws-current-mm-sql     PIC 99.
+              10 FILLER                PIC X VALUE '-'.
+              10 ws-current-dd-sql     PIC 99.
+
+      ******************************************************************
+      *                  WS FICHIER EN ENTREE                          *
+      ******************************************************************
+
+       01  ws-header.
+           05 ws-rec-number           PIC S9(9) COMP.
+           05 ws-file-error-status    PIC X.
+            88 file-in-error          VALUE 'E'.
+           05 ws-BIC                  PIC X(8).
+           05 ws-IBAN                 PIC X(35).
+           05 ws-type-message         PIC X(3).
+           05 ws-reference-message    PIC X(16).
+           05 ws-statement-number     PIC S9(9) COMP.
+           05 ws-currency             PIC XXX.
+           05 ws-date                 PIC X(10).
+           05 ws-D-C-init             PIC X.
+           05 ws-balance-init         PIC S9(12)V99 COMP-3.
+       01  ws-line.
+           05 ws-error-status         PIC X.
+           05 ws-val-date             PIC X(10).
+           05 ws-ent-date             PIC X(10).
+           05 ws-amount               PIC S9(12)V99 COMP-3.
+           05 ws-reference            PIC X(16).
+           05 ws-booking-ID           PIC X(16).
+           05 ws-image-ID             PIC X(34).
+           05 ws-booking-code         PIC X(4).
+      * pour alimenter le varchar info:
+           05  ws-info.
+              49 ws-info-lngth            PIC S9(4) COMP.
+              49 ws-info-text             PIC X(383).
+       01  ws-footer.
+            05 ws-date-file            PIC X(10).
+            05 ws-date-file-n REDEFINES ws-date-file.
+               10 ws-yyyy              PIC 9(4).
+               10 FILLER               PIC x(6).
+           05 ws-D-C-final            PIC X.
+           05 ws-balance              PIC S9(12)V99 COMP-3 .
+           05 ws-number-in-error      PIC S9(9) COMP.
+           05 ws-number-processed     PIC S9(9) COMP.
+      ******************************************************************
+      *                              SQL                               *
+      ******************************************************************
+      *****************************************************
+      * SQL INCLUDE pour SQLCA                            *
+      *****************************************************
+           EXEC SQL INCLUDE SQLCA  END-EXEC.
+
+      *****************************************************
+      * SQL déclarations pour Relevé                      *
+      *****************************************************
+           EXEC SQL DECLARE Z88751TA TABLE
+               (IDRELEVE  INTEGER        NOT NULL,
+               BIC       CHAR(8)         NOT NULL,
+               IBAN      CHAR(35)        NOT NULL,
+               TYPEMSSG  CHAR(3)                 ,
+               REFMSSG   CHAR(16)        NOT NULL,
+               NUMRELEVE INTEGER                 ,
+               SOLDEINIT DECIMAL(9,2)            ,
+               SOLDEFIN  DECIMAL(9,2)            ,
+               DATETRT   DATE                    ,
+               DATERELEVE DATE                   ,
+               COMPTABILISE CHAR(1)              ,
+               NBLIGNES  INTEGER                 ,
+               NMBERRORS INTEGER                 ,
+               ERRORSTAT CHAR(1))
+           END-EXEC.
+
+      *****************************************************
+      * SQL déclarations pour Ecriture                    *
+      *****************************************************
+           EXEC SQL DECLARE Z88751TB TABLE
+
+                 (IDECRITURE INTEGER      NOT NULL,
+                 REFMSSG   CHAR(16)       NOT NULL,
+                 NOLIGNE   INTEGER        NOT NULL,
+                 ERRORSTAT CHAR(1)                ,
+                 DATVAL    DATE                   ,
+                 DATCOMPT  DATE                   ,
+                 MONTANT   DECIMAL(9,2)           ,
+                 NOREF     CHAR(16)               ,
+                 IDCOMPTA  CHAR(16)               ,
+                 IDIMAGE   CHAR(34)               ,
+                 CDCOMPTA  CHAR(4)                ,
+                 INFOS     VARCHAR(383))
+           END-EXEC.
+
+
+      ******************************************************
+      *    messages d'erreur et de controle                *
+      ******************************************************
+       01  messages.
+           05 err-sql-error-releve     PIC X(40)
+              VALUE 'Erreur SQL sur INSERT de relevé :       '.
+           05 err-commit               PIC X(40)
+              VALUE 'Erreur SQL sur COMMIT :                 '.
+           05 err-insert-ecriture      PIC X(40)
+              VALUE 'Erreur SQL sur INSERT d''écriture :      '.
+           05 err-update-releve        PIC X(40)
+              VALUE 'Erreur SQL sur UPDATE de relevé :       '.
+           05 err-ecriture             PIC X(40)
+              VALUE 'Erreur création de l''écriture.         '.
+           05 ok-fichier-deja-en-erreur PIC X(40)
+              VALUE 'Relevé en erreur : voir liste précédente'.
+           05 ok-maj-releve            PIC X(40)
+              VALUE 'Le relevé a été créé dans la base       '.
+           05 ok-nombre-decritures     PIC X(40)
+              VALUE 'Nombre d''écritures total :              '.
+           05 ok-nombre-maj-base       PIC X(40)
+              VALUE 'Nombre de lignes Ecriture écrites BD :  '.
+           05 ok-nombre-a-traiter      PIC X(40)
+              VALUE 'Nombre d''écritures à traiter :          '.
+           05 ok-nombre-en-erreur      PIC X(40)
+              VALUE 'Nombre d''écritures en erreur :          '.
+           05 ok-nombre-erreur-input   PIC X(40)
+              VALUE ' - dont erreurs lors de la validation : '.
+           05 ok-nombre-erreur-sql     PIC X(40)
+              VALUE ' - dont erreurs de la maj de la base :  '.
+           05 ok-fichier-en-erreur     PIC X(40)
+              VALUE 'Relevé en erreur : erreurs de maj.      '.
+
+      *******************************************************
+      *  liste d'erreurs                                    *
+      *******************************************************
+       01  err-rec.
+           05 err-line                 PIC X(120).
+      *    headers
+       01  error-header.
+           05 error-header-1.
+              10 FILLER                PIC X(37) value SPACE.
+              10 FILLER                PIC X(47)
+                VALUE 'Liste des erreur pour Relevé de compte bancaire'.
+              10 FILLER                PIC X(36) VALUE SPACE.
+           05 error-header-2.
+              10 FILLER                PIC X(9)
+                                       VALUE 'Relevé : '.
+              10 err-statement-number  PIC 9(7).
+              10 FILLER                PIC X(2) VALUE SPACE.
+              10 FILLER                PIC X(13) VALUE 'Numéro BIC : '.
+              10 err-BIC               PIC X(8).
+              10 FILLER                PIC X(6) VALUE SPACE.
+              10 FILLER                PIC X(14) VALUE 'Numéro IBAN : '.
+              10 err-IBAN              PIC X(35).
+              10 FILLER                PIC X(6) VALUE SPACE.
+              10 FILLER                PIC X(17)
+                                       VALUE '  Type message : '.
+              10 err-type-message      PIC XXX.
+           05 error-header-3.
+              10 FILLER                PIC X(31)
+                 VALUE 'No. ligne, no. référence       '.
+              10 FILLER                PIC X(40) VALUE SPACE.
+              10 FILLER                PIC X(49) VALUE
+                 'SQL code                                         '.
+           05 error-header-end         PIC X(120) VALUE ALL '='.
+      *    ligne pour situations d'ABEND
+       01  abend-rec.
+           05 FILLER                   PIC X(18)
+                                       VALUE 'ABEND sur fichier '.
+           05 abend-fichier            PIC X(10).
+           05 FILLER                   PIC X(16)
+                                       VALUE '  file status : '.
+           05 abend-file-status        PIC XX.
+           05 FILLER                   PIC X(74) VALUE SPACE.
+       01  error-description.
+           05 err-line-number          PIC ZZZ.
+           05 FILLER                   PIC X(9) VALUE SPACE.
+           05 err-reference            PIC X(16).
+           05 FILLER                   PIC X(4) VALUE SPACE.
+           05 err-message              PIC X(40).
+           05 FILLER                   PIC X VALUE SPACE.
+           05 err-sqlcode              PIC -(8)9.
+           05 FILLER                   PIC X(38) VALUE SPACE.
+      *    footer
+       01  error-footer.
+           05 error-footer-1           PIC X(120) VALUE ALL '='.
+      *    ligne footer 2 est ligne 1 de la liste de controle
+           05 error-footer-3.
+              10 FILLER                PIC X(47) VALUE ALL '='.
+              10 FILLER                PIC X(27)
+                                    VALUE 'FIN DE LA LISTE DES ERREURS'.
+              10 FILLER                PIC X(46) VALUE ALL '='.
+
+      *******************************************************
+      *  liste de contrôle                                  *
+      *******************************************************
+       01  lst-rec                     PIC X(120).
+      *    headers
+       01  headers.
+           05 header-0.
+              10 FILLER                PIC X(55) VALUE ALL '='.
+              10 FILLER                PIC X(10) VALUE ' BNQ0002W '.
+              10 FILLER                PIC X(55) VALUE ALL '='.
+           05 header-1-1.
+              10 FILLER                PIC X(18)
+                                       VALUE 'EXEMPLE ASSURANCES'.
+              10 FILLER                PIC X(34) VALUE SPACE.
+              10 FILLER                PIC X(17)
+                                      VALUE 'Service comptable'.
+              10 FILLER                PIC X(41) VALUE SPACE.
+              10 header-1-date         PIC X(10).
+           05 header-1-2.
+              10 FILLER                PIC X(47) value SPACE.
+              10 FILLER                PIC X(25)
+                                      VALUE 'Relevé de compte bancaire'.
+              10 FILLER                PIC X(48) VALUE SPACE.
+      *
+           05 header-2-1.
+              10 FILLER                PIC X(9) VALUE 'Banque : '.
+              10 header-2-BIC          PIC X(8).
+              10 FILLER                PIC X(9) VALUE SPACE.
+              10 FILLER                PIC X(19)
+                                       VALUE 'Type transaction : '.
+              10 header-2-msg-type     PIC XXX.
+              10 FILLER                PIC XX VALUE SPACE.
+              10 FILLER                PIC X(19)
+                                       VALUE 'Réf. transaction : '.
+              10 header-2-reference-msg PIC X(16).
+              10 FILLER                PIC X(15) VALUE SPACE.
+              10 FILLER                PIC X(13)
+                                       VALUE 'Relevé no. : '.
+              10 header-2-statement-number PIC 9(7).
+           05 header-2-2.
+              10 FILLER                PIC X(9) VALUE 'IBAN   : '.
+              10 header-2-IBAN         PIC X(35).
+              10 FILLER                PIC X(76) VALUE SPACE.
+           05 header-2-3.
+              10 FILLER                PIC X(31)
+                 VALUE 'No. ligne, no. référence       '.
+              10 FILLER                PIC X(20)
+                 VALUE 'Message d''erreur    '.
+              10 FILLER                PIC X(69) VALUE SPACE.
+           05 header-2-end             PIC X(120) VALUE ALL '='.
+       01  headers-table REDEFINES headers.
+           05 header-line              PIC X(120) OCCURS 7.
+       01  num-head                    PIC 99 VALUE 7.
+
+      *    ligne de détail
+       01  detail-line.
+           05 detail-line-number       PIC ZZZ.
+           05 FILLER                   PIC X(9) VALUE SPACE.
+           05 detail-reference-number  PIC X(16).
+           05 FILLER                   PIC X(3) VALUE SPACE.
+           05 detail-error-message     PIC X(40).
+           05 FILLER                   PIC X VALUE SPACE.
+           05 detail-currency          PIC X(3).
+           05 FILLER                   PIC X VALUE SPACE.
+           05 detail-amount-x          PIC X(18).
+           05 detail-amount-n REDEFINES detail-amount-x
+                                       PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+           05 FILLER                   PIC X VALUE SPACE.
+           05 detail-d-c               PIC X.
+           05 FILLER                   PIC X(24) VALUE SPACE.
+      *    ligne de résumé
+       01  resume-line.
+           05 FILLER                   PIC X(10) VALUE SPACE.
+           05 resume-message           PIC X(40).
+           05 FILLER                   PIC X(5) VALUE SPACE.
+           05 resume-number            PIC ZZZZ9.
+           05 FILLER                   PIC X(60) VALUE SPACE.
+
+      *    footers
+       01  footers.
+           05 footer-0                 PIC X(120) VALUE ALL '='.
+           05 footer-1.
+              10 FILLER                PIC X(16)
+                                       VALUE 'LU : Nb lignes :'.
+              10 footer-nb-lines       PIC ZZ9.
+              10 FILLER                PIC X(44) VALUE SPACE.
+              10 FILLER                PIC X(27)
+                                   VALUE '    TRAITE : Nb écritures :'.
+              10 footer-nb-processed   PIC ZZ9.
+              10 FILLER                PIC X(24)
+                                       VALUE ',  Nb lignes en erreur :'.
+              10 footer-nb-in-error    PIC ZZ9.
+
+           05 footer-end.
+              10 FILLER                PIC X(43) VALUE ALL '='.
+              10 FILLER                PIC X(14)
+                                       VALUE 'fin du relevé '.
+              10 footer-num-rel-msg    PIC Z(11).
+              10 FILLER                PIC X(54) VALUE ALL '='.
+       01  footers-table REDEFINES footers.
+           05 footer-line              PIC X(120) OCCURS 3.
+       01  num-foot                    PIC 9 VALUE 3.
+
+       PROCEDURE DIVISION.
+      ******************************************************************
+      *    paragraphe principal                                        *
+      *    - ouverture des fichiers et inititialisations               *
+      *    - première lecture et traitement du header (lignes -1 et 0) *
+      *      (programme suppose un fichier d'entrée trié sur no ligne) *
+      *    - accès à la BD pour créer relevé                           *
+      *    - lecture des lignes des écritures du fichier intermédiaire *
+      *      et écriture des écritures dans base de données            *
+      *    - fermer les fichiers                                       *
+      *                                                                *
+      *    en cas d'erreur grave, l'ABEND se fait par un GO TO         *
+      ******************************************************************
+       0000-MAIN.
+           PERFORM 1000-OPEN-INIT
+           PERFORM 8000-ERR-LIST-HEAD-1
+
+           PERFORM 2000-READ-INTERMED
+           IF intermed-eof
+              GO TO 9000-EMPTY-FILE
+           END-IF
+
+           PERFORM UNTIL intermed-eof OR fatal-error
+              EVALUATE in-rec-number
+                 WHEN -1
+                    PERFORM 7000-PROCESS-HEADER-1
+                 WHEN 0
+                    PERFORM 7100-PROCESS-HEADER-2
+                    PERFORM 8010-ERR-LIST-HEAD-2
+                    PERFORM 8500-CONTROL-COMPT-HEADERS
+                    PERFORM 4000-DB-RELEVE
+                 WHEN OTHER
+                    PERFORM 7200-PROCESS-LINE
+                    PERFORM 4500-DB-ECRITURE
+              END-EVALUATE
+              PERFORM 2000-READ-INTERMED
+           END-PERFORM
+
+      * en cas d'erreurs sur écriture, maj du statut erreur de relevé
+           IF errors-occurred
+              PERFORM 4100-DB-RELEVE-UPDATE
+           END-IF
+           
+      * COMMIT
+           PERFORM 4900-COMMIT-BASE
+
+      * liste de contrôle: écriture du résumé des traitements
+           PERFORM 8800-CONTROL-COMPT-RESUME
+
+           PERFORM 8700-CONTROL-COMPT-FOOTER
+           PERFORM 9900-STOP.
+
+           STOP RUN
+           .
+
+      ******************************************************************
+      *                  OUVERTURES ET INITIALISATIONS                 *
+      ******************************************************************
+       1000-OPEN-INIT.
+           OPEN OUTPUT error-list
+           IF NOT error-ok
+              CLOSE error-list
+              GO TO 9999-ABEND-12
+           END-IF
+
+           OPEN INPUT intermed
+           IF NOT intermed-ok
+              MOVE 'intermed'          TO abend-fichier
+              MOVE intermed-file-status   TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list intermed
+              GO TO  9999-ABEND-12
+           END-IF
+
+           OPEN OUTPUT liste-controle
+           IF NOT controle-ok
+              MOVE 'lstcntrl'          TO abend-fichier
+              MOVE controle-file-status TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list intermed
+              CLOSE liste-controle
+              GO TO 9999-ABEND-12
+           END-IF
+
+           MOVE SPACE TO err-rec lst-rec
+           PERFORM 1010-INIT-HEADERS
+           PERFORM 1020-INIT-ERR-DETAILS
+           PERFORM 1030-INIT-DETAILS
+           PERFORM 1040-INIT-RESUME
+           PERFORM 1300-GET-CURRENT-DATE
+           .
+
+      *********************************************************
+      *    initialisations                                    *
+      *********************************************************
+
+       1010-INIT-HEADERS.
+           INITIALIZE header-1-1 header-2-1 header-2-2
+           .
+
+       1020-INIT-ERR-DETAILS.
+           MOVE SPACE TO error-description
+           .
+
+       1030-INIT-DETAILS.
+           INITIALIZE detail-line
+           .
+
+       1040-INIT-RESUME.
+           INITIALIZE resume-line
+           .
+
+      *******************************************************
+      *    lecture de la date du jour                       *
+      *******************************************************
+       1300-GET-CURRENT-DATE.
+           ACCEPT ws-current-date FROM SYSIN
+           MOVE ws-current-dd           TO ws-current-dd-display
+                                           ws-current-dd-sql
+           MOVE ws-current-mm           TO ws-current-mm-display
+                                           ws-current-mm-sql
+           MOVE ws-current-yyyy         TO ws-current-yyyy-display
+                                           ws-current-yyyy-sql
+           MOVE ws-current-date-display TO header-1-date
+           .
+
+      ******************************************************************
+      *                          LECTURE                               *
+      ******************************************************************
+       2000-READ-INTERMED.
+           READ intermed
+           NOT AT END
+              ADD 1                    TO cnt-total
+           END-READ
+           .
+
+      ******************************************************************
+      *                         ECRITURE                               *
+      ******************************************************************
+       3000-WRITE-ERR-LST.
+           WRITE error-rec             FROM err-line
+           .
+
+       3100-WRITE-RAP-COMPT.
+           WRITE rap-compt-rec         FROM lst-rec
+           MOVE SPACE TO lst-rec
+           .
+
+      ******************************************************************
+      *                     ACCES A LA BASE DE DONNEES                 *
+      ******************************************************************
+      *************************************************************
+      *    Appel INSERT Relevé et gestion des situations d'erreur *
+      *************************************************************
+       4000-DB-RELEVE.
+           PERFORM 5000-INSERT-RELEVE
+           IF SQLCODE NOT = 0
+              MOVE err-sql-error-releve TO err-message
+              MOVE SQLCODE             TO err-sqlcode
+              PERFORM 8100-ERR-DETAILS
+              MOVE 8                   TO ws-return-code 
+              SET fatal-error          TO TRUE
+           ELSE
+              MOVE ok-maj-releve       TO detail-error-message
+              PERFORM 8600-CONTROL-COMPT-DETAILS
+           END-IF
+           .
+
+      ***********************************************************
+      *    Préparation, appel et gestion erreurs UPDATE Relevé  *
+      ***********************************************************
+       4100-DB-RELEVE-UPDATE.
+           MOVE 'E'                    TO ws-file-error-status
+           PERFORM 5100-UPDATE-RELEVE
+           IF SQLCODE = 0 THEN
+              MOVE 4                   TO ws-return-code 
+           ELSE
+              MOVE 8                   TO ws-return-code 
+              MOVE err-update-releve   TO err-message
+              MOVE SQLCODE             TO err-sqlcode
+              PERFORM 8100-ERR-DETAILS
+           END-IF
+           .
+
+      ***********************************************************
+      *    Appel et gestion erreurs INSERT écriture             *
+      ***********************************************************
+       4500-DB-ECRITURE.
+           PERFORM 5500-INSERT-ECRITURE
+           IF SQLCODE = 0 THEN
+              ADD 1                    TO cnt-inserted
+              IF ws-error-status = 'T' THEN
+                 ADD 1                 TO cnt-to-process
+              END-IF
+           ELSE
+              SET errors-occurred      TO TRUE
+              MOVE err-insert-ecriture TO err-message
+              MOVE SQLCODE             TO err-sqlcode
+              PERFORM 8100-ERR-DETAILS
+              PERFORM 8600-CONTROL-COMPT-DETAILS
+              ADD 1                    TO cnt-errors
+           END-IF
+           .
+
+      ******************************************************
+      *    Appel et gestion erreurs COMMIT                 *
+      ******************************************************
+       4900-COMMIT-BASE.
+           PERFORM 5900-COMMIT
+           IF SQLCODE NOT = 0
+              MOVE err-commit          TO err-message
+              MOVE SQLCODE             TO err-sqlcode
+              PERFORM 8100-ERR-DETAILS
+           END-IF
+           .
+
+      ******************************************************
+      *    INSERT du relevé                                *
+      ******************************************************
+       5000-INSERT-RELEVE.
+           EXEC SQL
+              INSERT INTO Z88751TA (BIC             ,
+                                   IBAN             ,
+                                   TYPEMSSG         ,
+                                   REFMSSG          ,
+                                   NUMRELEVE        ,
+                                   SOLDEINIT        ,
+                                   SOLDEFIN         ,
+                                   DATETRT          ,
+                                   DATERELEVE       ,
+                                   COMPTABILISE     ,
+                                   NBLIGNES         ,
+                                   NMBERRORS        ,
+                                   ERRORSTAT)
+                     VALUES (:ws-BIC                ,
+                             :ws-IBAN               ,
+                             :ws-type-message       ,
+                             :ws-reference-message  ,
+                             :ws-statement-number   ,
+                             :ws-balance-init       ,
+                             :ws-balance            ,
+                             :ws-date               ,
+                             :ws-date-file          ,
+                             :ws-comptabilise       ,
+                             :ws-nb-to-insert       ,
+                             :ws-zero               ,
+                             :ws-file-error-status
+                             )
+           END-EXEC
+           .
+
+      ********************************************************
+      *    UPDATE du relevé                                  *
+      ********************************************************
+       5100-UPDATE-RELEVE.
+           EXEC SQL
+              UPDATE Z88751TA SET ERRORSTAT = :ws-file-error-status,
+                                  NBLIGNES  = :cnt-inserted,
+                                  NMBERRORS  = :cnt-errors
+                              WHERE REFMSSG = :ws-reference-message
+           END-EXEC
+           .
+
+      ********************************************************
+      *    INSERT de l'écriture                              *
+      ********************************************************
+       5500-INSERT-ECRITURE.
+           EXEC SQL
+              INSERT INTO Z88751TB (REFMSSG       ,
+                 NOLIGNE                          ,
+                 ERRORSTAT                        ,
+                 DATVAL                           ,
+                 DATCOMPT                         ,
+                 MONTANT                          ,
+                 NOREF                            ,
+                 IDCOMPTA                         ,
+                 IDIMAGE                          ,
+                 CDCOMPTA                         ,
+                 INFOS)
+              VALUES (:ws-reference-message       ,
+              :ws-rec-number                      ,
+              :ws-error-status                    ,
+              :ws-val-date                        ,
+              :ws-ent-date                        ,
+              :ws-amount                          ,
+              :ws-reference                       ,
+              :ws-booking-ID                      ,
+              :ws-image-ID                        ,
+              :ws-booking-code                    ,
+              :ws-info)
+           END-EXEC
+           .
+
+      ***************************************************
+      *    COMMIT                                       *
+      ***************************************************
+       5900-COMMIT.
+           EXEC SQL
+              COMMIT
+           END-EXEC
+           .
+
+      ******************************************************************
+      *                   TRAITEMENTS DES DONNEES                      *
+      ******************************************************************
+      ****************************************
+      *    Première ligne (numéro ligne -1)  *
+      ****************************************
+       7000-PROCESS-HEADER-1.
+           MOVE in-file-error-status   TO ws-file-error-status
+
+           MOVE in-BIC                 TO ws-BIC
+                                          err-BIC
+                                          header-2-BIC
+           MOVE in-IBAN                TO ws-IBAN
+                                          err-IBAN
+                                          header-2-IBAN
+           MOVE in-type-message        TO ws-type-message
+                                          err-type-message
+                                          header-2-msg-type
+           MOVE in-reference-message   TO ws-reference-message
+                                          header-2-reference-msg
+           MOVE in-statement-number    TO ws-statement-number
+           MOVE in-currency            TO ws-currency
+           MOVE in-date                TO ws-date
+           IF in-D-C-init = 'D' THEN
+              COMPUTE ws-balance-init = in-solde-init * -1
+           ELSE
+              MOVE in-solde-init       TO ws-balance-init
+           END-IF 
+           .
+
+      ****************************************
+      *    Deuxième ligne (numéro ligne )    *
+      ****************************************
+       7100-PROCESS-HEADER-2.
+           MOVE in-date-file           TO ws-date-file
+           COMPUTE ws-statement-number = 1000 * ws-yyyy +
+                                         ws-statement-number
+           MOVE ws-statement-number    TO err-statement-number
+                                          header-2-statement-number
+                                          footer-num-rel-msg
+
+           IF in-D-C-final = 'D' THEN
+              COMPUTE ws-balance = in-balance * -1
+           ELSE
+              MOVE in-balance          TO ws-balance
+           END-IF
+           MOVE in-number-in-error     TO ws-number-in-error
+           MOVE in-number-processed    TO ws-number-processed
+           COMPUTE ws-nb-to-insert  = 
+                             ws-number-in-error + ws-number-processed 
+           .
+
+      ****************************************
+      *    Lignes détail (numéro ligne > 0   *
+      ****************************************
+       7200-PROCESS-LINE.
+           ADD 1                       TO cnt-lines
+           MOVE in-rec-number          TO ws-rec-number
+                                          err-line-number 
+                                          detail-line-number
+           MOVE in-error-status        TO ws-error-status
+           MOVE in-val-date            TO ws-val-date
+           MOVE in-ent-date            TO ws-ent-date
+           MOVE in-D-C-detail          TO detail-d-c
+           MOVE ws-currency            TO detail-currency
+           MOVE in-amount              TO detail-amount-n
+           IF in-D-C-detail = 'D' THEN
+              COMPUTE ws-amount = in-amount * -1
+           ELSE
+              MOVE in-amount              TO ws-amount
+           END-IF
+           MOVE in-reference           TO ws-reference
+                                          detail-reference-number
+                                          err-reference
+           MOVE in-booking-ID          TO ws-booking-ID
+           MOVE in-image-ID            TO ws-image-ID
+           MOVE in-booking-code        TO ws-booking-code
+           
+           COMPUTE ws-length = FUNCTION LENGTH 
+                                   (FUNCTION TRIM (in-info TRAILING))
+           MOVE ws-length              TO ws-info-lngth
+           MOVE in-info(1:ws-length)   TO ws-info-text
+           .
+
+
+      ******************************************************************
+      *                     IMPRESSION DES LISTES                      *
+      ******************************************************************
+      * ************************************************
+      *    liste d'erreurs                             *
+      **************************************************
+      * -- Entête avant lecture du fichier d'entrée
+       8000-ERR-LIST-HEAD-1.
+           MOVE header-0               TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE header-1-1             TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-header-1         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           .
+
+      * -- Entête après lecture du fichier d'entrée
+       8010-ERR-LIST-HEAD-2.
+           MOVE error-header-2         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-header-3         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE header-2-end           TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           .
+
+      * -- ligne erreur détails
+       8100-ERR-DETAILS.
+           MOVE error-description      TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           PERFORM 1020-INIT-ERR-DETAILS
+           .
+
+      * -- lignes finales erreur
+       8200-ERR-FOOTER.
+           MOVE cnt-total              TO footer-nb-lines
+           MOVE cnt-inserted          TO footer-nb-processed
+           MOVE cnt-errors             TO footer-nb-in-error
+
+           MOVE error-footer-1         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE footer-1               TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-footer-3         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           .
+
+      * -- lignes d'ABEND en début de programme
+       8300-ERR-EARLY-ABEND.
+           PERFORM 8000-ERR-LIST-HEAD-1
+           WRITE error-rec FROM abend-rec
+           PERFORM 8200-ERR-FOOTER
+           .
+
+      ****************************************************
+      *    liste de contrôle                             *
+      ****************************************************
+      * -- Entête de la liste de contrôle
+       8500-CONTROL-COMPT-HEADERS.
+           PERFORM VARYING cnt FROM 1 BY 1 UNTIL cnt > num-head
+              MOVE header-line (cnt) TO lst-rec
+              PERFORM 3100-WRITE-RAP-COMPT
+           END-PERFORM
+           IF ws-file-error-status = 'E' THEN
+              MOVE ok-fichier-deja-en-erreur TO detail-error-message
+              PERFORM 8600-CONTROL-COMPT-DETAILS
+           END-IF
+           .
+
+      * -- Ligne détail de la liste de contrôle
+       8600-CONTROL-COMPT-DETAILS.
+           IF detail-error-message = SPACE THEN
+              MOVE err-ecriture        TO detail-error-message
+           END-IF
+           MOVE detail-line            TO lst-rec
+           PERFORM 3100-WRITE-RAP-COMPT
+           PERFORM 1030-INIT-DETAILS
+           .
+
+      * -- Ligne de résumé de la liste de contrôle
+       8650-CONTROL-COMPT-RESUME.
+           MOVE resume-line            TO lst-rec
+           PERFORM 3100-WRITE-RAP-COMPT
+           PERFORM 1040-INIT-RESUME
+           .
+
+      * -- Ligne vide de la liste de contrôle
+       8660-CONTROL-COMPT-EMPTY.
+           MOVE SPACE                  TO lst-rec
+           PERFORM 3100-WRITE-RAP-COMPT
+           .
+
+      * -- Lignes finales de la liste de contrôle
+       8700-CONTROL-COMPT-FOOTER.
+           MOVE cnt-total              TO footer-nb-lines
+           MOVE cnt-inserted          TO footer-nb-processed
+           MOVE cnt-errors             TO footer-nb-in-error
+           PERFORM VARYING cnt FROM 1 BY 1 UNTIL cnt > num-foot
+              MOVE footer-line(cnt)  TO lst-rec
+              PERFORM 3100-WRITE-RAP-COMPT
+           END-PERFORM
+           .
+
+      ******************************************************************
+      *               PREPARATION DES DONNEES RESUME                   *
+      ******************************************************************
+       8800-CONTROL-COMPT-RESUME.
+           COMPUTE cnt-error-lines = ws-number-in-error + cnt-errors
+     
+           PERFORM 8660-CONTROL-COMPT-EMPTY
+           MOVE ok-nombre-decritures   TO resume-message
+           MOVE cnt-lines              TO resume-number
+           PERFORM 8650-CONTROL-COMPT-RESUME
+           MOVE ok-nombre-maj-base     TO resume-message 
+           MOVE cnt-inserted           TO resume-number
+           PERFORM 8650-CONTROL-COMPT-RESUME
+           MOVE ok-nombre-a-traiter    TO resume-message
+           MOVE cnt-to-process         TO resume-number 
+           PERFORM 8650-CONTROL-COMPT-RESUME 
+           MOVE ok-nombre-en-erreur    TO resume-message
+           MOVE cnt-error-lines        TO resume-number
+           PERFORM 8650-CONTROL-COMPT-RESUME
+           MOVE ok-nombre-erreur-input TO resume-message
+           MOVE ws-number-in-error     TO resume-number
+           PERFORM 8650-CONTROL-COMPT-RESUME
+           MOVE ok-nombre-erreur-sql   TO resume-message
+           MOVE cnt-errors             TO resume-number
+           PERFORM 8650-CONTROL-COMPT-RESUME
+           IF errors-occurred
+              PERFORM 8660-CONTROL-COMPT-EMPTY
+              MOVE ok-fichier-en-erreur TO resume-message
+              MOVE cnt-errors           TO resume-number 
+              PERFORM 8650-CONTROL-COMPT-RESUME
+           END-IF
+           .
+
+      ******************************************************************
+      *                 GERER DES SITUATIONS D'ABEND                   *
+      ******************************************************************
+       9000-EMPTY-FILE.
+           MOVE 'intermed'          TO abend-fichier
+           MOVE intermed-file-status   TO abend-file-status
+           PERFORM 8300-ERR-EARLY-ABEND
+           CLOSE error-list intermed
+           GO TO  9999-ABEND-12
+           .     
+
+      ******************************************************************
+      *         TERMINER LES LISTES, FERMER LES FICHIERS               *
+      ******************************************************************
+       9900-STOP.
+           CLOSE liste-controle
+           CLOSE intermed
+
+           PERFORM 8200-ERR-FOOTER
+           CLOSE error-list
+           MOVE ws-return-code         TO RETURN-CODE
+           .
+
+      ******************************************************************
+      *                                ABEND                           *
+      ******************************************************************
+
+       9999-ABEND-12.
+           MOVE 12                     TO RETURN-CODE
+           STOP RUN
+           .
+

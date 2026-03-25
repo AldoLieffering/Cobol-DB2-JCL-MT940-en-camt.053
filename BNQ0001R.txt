@@ -1,0 +1,1978 @@
+      *
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID.     BNQ0001R.
+       AUTHOR.         Aldo Lieffering.
+       DATE-WRITTEN.   Mars 2026.
+
+      ******************************************************************
+      *    Ce programme fait partie d'un projet personnel pour montrer *
+      *               mes compétences Cobol, JCL et DB2.               *
+      ******************************************************************
+      **                                                              **
+      **   Ce programme lit un fichier MT940 (relevé de compte)       **
+      **   et vérifie si le fichier est complet, correctement         **
+      **   formatté, et si les données sont techniquement valides.    **
+      **                                                              **
+      **   INPUT:                                                     **
+      **   - paramètres: (langue des libellés à afficher, BIC, IBAN,  **
+      **                  type de message).                           **
+      **   - fichier traduisant les codes comptables en libellés en   **
+      **     4 langues.                                               **
+      **   - fichier MT940.                                           **
+      **   OUPUT:                                                     **
+      **   - fichier intermédiaire pour communiquer les données       **
+      **     servant dans la mise-à-jour de Base de Données.          **
+      **   - liste des erreurs.                                       **
+      **   - liste des écritures traitées                             **
+      **                                                              **
+      ******************************************************************
+      ******************************************************************
+
+       ENVIRONMENT DIVISION.
+       CONFIGURATION SECTION.
+       SPECIAL-NAMES.
+           DECIMAL-POINT IS COMMA.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT parameters ASSIGN TO params
+           FILE STATUS IS param-file-status.
+
+           SELECT codes-comptables ASSIGN TO cdscompt
+           FILE STATUS IS codes-compt-file-status.
+
+           SELECT mt-940 ASSIGN TO mt940
+           FILE STATUS IS mt940-file-status.
+
+           SELECT out-file ASSIGN TO outfile
+           FILE STATUS IS out-file-status.
+
+           SELECT liste-controle ASSIGN TO lstcntrl
+           FILE STATUS IS controle-file-status.
+
+           SELECT error-list ASSIGN TO errlst
+           FILE STATUS IS error-file-status.
+
+       DATA DIVISION.
+       FILE SECTION.
+      * paramètres
+       FD  parameters RECORDING MODE IS F.
+       01  param-rec                   PIC X(80).
+
+      * fichier des codes comptables et leur traduction en libellés
+       FD  codes-comptables RECORDING MODE IS V
+                                      RECORD VARYING FROM 21 TO 386
+                                      DEPENDING ON ws-code-compt-length.
+       01  codes-compt-rec.
+           05 codes OCCURS 21 TO 386 DEPENDING ON ws-codes-length.
+              10 cdcp                   PIC X.
+
+
+      * fichier en entrée MT940: extrait de compte
+       FD  mt-940 RECORDING MODE F.
+       01  mt-940-rec                  PIC X(640).
+
+      * fichier en sortie: header, lignes, footer pour maj BD
+       FD  out-file RECORDING MODE V
+                    RECORD VARYING FROM 37 TO 493.
+       01  out-header.
+           05 out-rec-number           PIC S9(4).
+           05 out-file-error-status    PIC X.
+           05 out-BIC                  PIC X(8).
+           05 out-IBAN                 PIC X(35).
+           05 out-type-message         PIC X(3).
+           05 out-reference-message    PIC X(16).
+           05 out-statement-number     PIC 9(5).
+           05 out-currency             PIC XXX.
+           05 out-date                 PIC X(10).
+           05 out-D-C-init             PIC X.
+           05 out-balance-init         PIC 9(12)V99.
+       01  out-line.
+           05                          PIC S9(4).
+           05 out-error-status         PIC X.
+           05 out-val-date             PIC X(10).
+           05 out-ent-date             PIC X(10).
+           05 out-D-C-detail           PIC X.
+           05 out-amount               PIC 9(12)V99.
+           05 out-reference            PIC X(16).
+           05 out-booking-ID           PIC X(16).
+           05 out-image-ID             PIC X(34).
+           05 out-booking-code         PIC X(4).
+           05 out-info                 PIC X(383).
+       01  out-footer.
+           05                          PIC S9(4).
+           05 out-date-file            PIC X(10).
+           05 out-D-C-final            PIC X.
+           05 out-balance              PIC 9(12)V99.
+           05 out-number-in-error      PIC 9(4).
+           05 out-number-processed     PIC 9(4).
+
+
+      * liste de controle
+       FD  liste-controle RECORDING MODE IS F.
+       01  rap-compt-rec               PIC X(120).
+
+      * liste des erreurs
+       FD  error-list RECORDING MODE IS F.
+       01  error-rec                   PIC X(120).
+
+       WORKING-STORAGE SECTION.
+      *******************************************************
+      * File status et longueur record                      *
+      *******************************************************
+       01  param-file-status           PIC XX.
+         88 param-ok                   VALUE '00'.
+         88 param-eof                  VALUE '10'.
+       01  controle-file-status         PIC XX.
+         88 controle-ok                 VALUE '00'.
+       01  error-file-status           PIC XX.
+         88 error-ok                   VALUE '00'.
+       01  mt940-file-status           PIC XX.
+         88 mt940-ok                   VALUE '00'.
+         88 mt940-eof                  VALUE '10'.
+       01  codes-compt-file-status     PIC XX.
+         88 codes-comptables-ok        VALUE '00'.
+         88 codes-comptables-eof       VALUE '10'.
+       01  out-file-status             PIC XX.
+         88 out-file-ok                VALUE '00'.
+       01 ws-code-compt-length         PIC 999.
+       01 ws-codes-length              PIC 999.
+
+      *******************************************************
+      *  switches                                           *
+      *******************************************************
+      * initialisation ok. Défault: Y
+       01                              PIC X VALUE 'Y'.
+         88 init-ok                          VALUE 'Y'.
+         88 init-ko                          VALUE 'N'.
+      * chargement montant ok. Défaut: Y
+       01                              PIC X VALUE 'Y'.
+         88 amount-ok                        VALUE 'Y'.
+         88 amount-ko                        VALUE 'N'.
+      * relevé ok et donc à comptabiliser par la suite
+       01                              PIC X VALUE 'Y'.
+         88 releve-ok                        VALUE 'Y'.
+         88 releve-ko                        VALUE 'N'.
+      * écriture du relevé ok. Défaut: Y
+       01                              PIC X VALUE 'Y'.
+         88 record-ok                        VALUE 'Y'.
+         88 record-ko-general                VALUE 'N'.
+         88 record-ko-partial                VALUE 'P'.
+      * type de ligne précédent. Défault: 00 (autre)
+       01                              PIC XX VALUE '00'.
+         88 previous-other                    VALUE '00'.
+         88 previous-61                       VALUE '61'.
+         88 previous-86                       VALUE '86'.
+      * nombre d'occurence d'un type de ligne. Défault: 0
+       01.
+           05 nb-1                     PIC 9  VALUE ZERO.
+              88 1-ok                         VALUE 1.
+           05 nb-20                    PIC 9  VALUE ZERO.
+              88 20-ok                        VALUE 1.
+           05 nb-25                    PIC 9  VALUE ZERO.
+              88 25-ok                        VALUE 1.
+           05 nb-28C                   PIC 9  VALUE ZERO.
+              88 28C-ok                       VALUE 1.
+           05 nb-60a                   PIC 9  VALUE ZERO.
+              88 60a-ok                       VALUE 1.
+
+      *******************************************************
+      *  compteurs, champs intermédiaires, de validation    *
+      *******************************************************
+       01  counters.
+           05 cnt-bkcd                 PIC 999 VALUE ZERO.
+           05 cnt                      PIC 99.
+           05 point                    PIC 999.
+           05 begin                    PIC 999.
+           05 lngth                    PIC 999.
+      *
+           05 cnt-lines                PIC 999 VALUE ZERO.
+           05 cnt-out-line             PIC S9(4) VALUE ZERO.
+           05 cnt-61                   PIC 999 VALUE ZERO.
+           05 cnt-86                   PIC 999 VALUE ZERO.
+           05 cnt-processed            PIC 999 VALUE ZERO.
+           05 cnt-in-error             PIC 999 VALUE ZERO.
+           05 cnt-errors               PIC 999 VALUE ZERO.
+      *    pour contrôle des montants
+       01.
+           05 amount-x.
+              10 amount-floor          PIC 9(12) VALUE ZERO.
+              10 amount-decimals       PIC 99     VALUE ZERO.
+           05 amount-n REDEFINES amount-x PIC 9(12)V99.
+           05 amount-decimals-2        PIC 99.
+      *    pour manipuler le numéro de relevé
+       01.
+           05 ws-statement-number      PIC S9(5) COMP.
+           05 ws-year-statement        PIC S9(9) COMP.
+           05 ws-y-s-n                 PIC 9(9).
+           05 ws-y-s REDEFINES ws-y-s-n.
+              10 FILLER                PIC XX.
+              10 ws-yyyy-statement     PIC X(4).
+              10 ws-number-statement   PIC X(3).
+           05 ws-year-statement-1      PIC S9(9) COMP.
+      *    pour transformation de montants
+           05 ws-amount             PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+           05 ws-amount-x REDEFINES ws-amount PIC X(18).
+      *    cumuls
+           05 ws-cumul-D               PIC 9(12)V99 VALUE ZERO.
+           05 ws-cumul-C               PIC 9(12)V99 VALUE ZERO.
+           05 ws-balance               PIC S9(12)V99.
+           05 ws-cumul-err-D           PIC 9(12)V99.
+           05 ws-cumul-err-C           PIC 9(12)V99.
+
+      *******************************************************
+      *  dates                                              *
+      *******************************************************
+      * -- vérifications:
+       01.
+           05 ws-D-C                   PIC X.
+           05 ws-date.
+              10 ws-cc                 PIC XX.
+              10 ws-yy                 PIC XX.
+              10 ws-mm                 PIC XX.
+              10 ws-dd                 PIC XX.
+           05 ws-date-n REDEFINES ws-date PIC 9(8).
+           05 ws-date-comp-1           PIC S9(9).
+           05 ws-date-comp-2           PIC S9(9).
+           05 ws-date-10.
+              10 ws-cc-10               PIC XX.
+              10 ws-yy-10               PIC XX.
+              10 FILLER                 PIC X VALUE '-'.
+              10 ws-mm-10               PIC XX.
+              10 FILLER                 PIC X VALUE '-'.
+              10 ws-dd-10               PIC XX.
+           05 ws-date-zero              PIC X(10) VALUE '0001-01-01'.
+
+      * -- date système
+       01  dates.
+           05 ws-current-date.
+              10 ws-current-yyyymmdd-x.
+                 15 ws-current-yyyy    PIC 9(4).
+                 15 ws-current-mm      PIC 99.
+                 15 ws-current-dd      PIC 99.
+              10 ws-current-yyyymmdd REDEFINES ws-current-yyyymmdd-x
+                                       PIC 9(8).
+              10 ws-current-time       PIC X(12).
+           05 ws-current-date-display.
+              10 ws-current-dd-display PIC 99.
+              10 FILLER                PIC X VALUE '/'.
+              10 ws-current-mm-display PIC 99.
+              10 FILLER                PIC X VALUE '/'.
+              10 ws-current-yyyy-display PIC 9(4).
+           05 ws-current-date-sql.
+              10 ws-current-yyyy-sql   PIC 9(4).
+              10 FILLER                PIC X VALUE '-'.
+              10 ws-current-mm-sql     PIC 99.
+              10 FILLER                PIC X VALUE '-'.
+              10 ws-current-dd-sql     PIC 99.
+
+      ******************************************************************
+      *                      PARAMETRES                                *
+      ******************************************************************
+       01.
+           05.
+              10 param-language        PIC X VALUE SPACE.
+                88 english             VALUE 'E'.
+                88 german              VALUE 'G'.
+                88 french              VALUE 'F'.
+                88 italian             VALUE 'I'.
+              10 FILLER                PIC X(79).
+           05.
+              10 param-BIC             PIC X(8).
+              10 FILLER                PIC X(72).
+           05.
+              10 param-IBAN            PIC X(35).
+              10 FILLER                PIC X(45).
+           05.
+              10 param-transaction-type PIC X(3).
+              10 FILLER                PIC X(77).
+
+      ******************************************************************
+      *                WS FICHIERS EN ENTREE                           *
+      ******************************************************************
+
+      *******************************************************
+      *  table des codes comptables                         *
+      *******************************************************
+       01  booking-codes-table.
+           05 bkcd-rec OCCURS 100 ASCENDING KEY IS bkcd-code
+              INDEXED BY idx-bkcd.
+              10 bkcd-code             PIC 9(4).
+              10 bkcd-german           PIC X(99).
+              10 bkcd-english          PIC X(99).
+              10 bkcd-french           PIC X(99).
+              10 bkcd-italian          PIC X(99).
+           05 bkcd-number              PIC 999 VALUE 100.
+
+
+      *******************************************************
+      *  Ligne et Working Storage des valeurs lus MT940     *
+      *******************************************************
+       01  ws-mt940.
+           05 ws-940-code              PIC X(3).
+              88 code-61               VALUE ':61'.
+              88 code-62               VALUE ':62'.
+              88 code-86               VALUE ':86'.
+           05 FILLER                   PIC X(637).
+      * -- 1: l'entête du message
+       01.
+           05 ws-1.
+              10 ws-1-BIC              PIC X(8).
+      * -- 4: le corps du message
+           05 ws-20.
+              10 ws-20-reference       PIC X(16).
+           05 ws-25.
+              10 ws-25-IBAN            PIC X(35).
+           05 ws-28c.
+              10 ws-28-statement-number PIC X(11).
+           05 ws-60a.
+              10 ws-60-FM              PIC X.
+                 88 first-message      VALUE 'F'.
+                 88 next-message       VALUE 'M'.
+              10 ws-60-date.
+                 15 ws-60-date-ccyy.
+                    20 ws-60-date-cc   PIC XX VALUE '20'.
+                    20 ws-60-date-yy   PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-60-date-mm      PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-60-date-dd      PIC XX.
+              10 ws-60-opening-bal     PIC 9(9)V99.
+           05 ws-61.
+              10 ws-61-val-date.
+                 15 ws-61-val-date-cc  PIC XX VALUE '20'.
+                 15 ws-61-val-date-yy  PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-61-val-date-mm  PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-61-val-date-dd  PIC XX.
+              10 ws-61-entry-date.
+                 15 ws-61-ent-date-cc  PIC XX VALUE '20'.
+                 15 ws-61-ent-date-yy  PIC XX.
+                 15 ws-61-ent-date-yy-n
+                       REDEFINES ws-61-ent-date-yy PIC 99.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-61-ent-date-mm  PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-61-ent-date-dd  PIC XX.
+              10 ws-61-D-C             PIC X.
+              10 ws-61-amount          PIC 9(12)V99.
+           05 ws-62.
+              10 ws-62-FM              PIC X.
+                 88 final-balance      VALUE 'F'.
+                 88 intermediate-balance VALUE 'M'.
+              10 ws-62-date.
+                 15 ws-62-date-ccyy.
+                    20 ws-62-date-cc   PIC XX VALUE '20'.
+                    20 ws-62-date-yy   PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-62-date-mm      PIC XX.
+                 15 FILLER             PIC X VALUE '-'.
+                 15 ws-62-date-dd      PIC XX.
+
+      ******************************************************************
+      *                              SQL                               *
+      ******************************************************************
+      *****************************************************
+      * SQL INCLUDE pour SQLCA                            *
+      *****************************************************
+           EXEC SQL INCLUDE SQLCA  END-EXEC.
+
+      *****************************************************
+      * SQL déclarations pour View Relevé                 *
+      *****************************************************
+           EXEC SQL DECLARE Z88751TA TABLE
+               (IDRELEVE  INTEGER        NOT NULL,
+               BIC       CHAR(8)         NOT NULL,
+               IBAN      CHAR(35)        NOT NULL,
+               TYPEMSSG  CHAR(3)                 ,
+               REFMSSG   CHAR(16)        NOT NULL,
+               NUMRELEVE INTEGER                 ,
+               SOLDEINIT DECIMAL(9,2)            ,
+               SOLDEFIN  DECIMAL(9,2)            ,
+               DATETRT   DATE                    ,
+               DATERELEVE DATE                   ,
+               COMPTABILISE CHAR(1)              ,
+               NBLIGNES  INTEGER                 ,
+               NMBERRORS INTEGER                 ,
+               ERRORSTAT CHAR(1))
+           END-EXEC.
+
+      *****************************************************
+      * SQL cursors                                       *
+      *****************************************************
+      * -- cursor pour trouver relevé par numéro de référence
+           EXEC SQL DECLARE CURSOR-RELEVE-1  CURSOR FOR
+               SELECT REFMSSG  FROM Z88751TA
+                      WHERE REFMSSG = :ws-20-reference
+           END-EXEC.
+
+      * -- cursor pour trouver dernier relevé avant relevé présent
+           EXEC SQL DECLARE CURSOR-RELEVE-2  CURSOR FOR
+               SELECT BIC                        ,
+                      IBAN                       ,
+                      NUMRELEVE                  ,
+                      SOLDEFIN  FROM Z88751TA
+                      WHERE BIC = :ws-1-BIC      AND
+                            IBAN = :ws-25-IBAN   AND
+                            NUMRELEVE = (
+                              SELECT MAX(NUMRELEVE)
+                              FROM Z88751TA
+                              WHERE NUMRELEVE < :ws-year-statement)
+           END-EXEC.
+
+      ****************************************************
+      * WS pour recevoir le record RELEVE                *
+      ****************************************************
+       01  record-releve.
+           05 rlv-refmssg              PIC X(16).
+           05 rlv-BIC                  PIC X(8).
+           05 rlv-IBAN                 PIC X(35).
+           05 rlv-numreleve            PIC S9(9) COMP.
+           05 rlv-soldefin             PIC S9(12)V99 COMP-3.
+       01  indicators-releve.
+           05 rlv-BIC-ind              PIC S9(4) BINARY.
+           05 rlv-IBAN-ind             PIC S9(4) BINARY.
+           05 rlv-numreleve-ind        PIC S9(4) BINARY.
+           05 rlv-soldefin-ind         PIC S9(4) BINARY.
+           05 rlv-refmssg-ind          PIC S9(4) BINARY.
+       01  ws-sqlcode                  PIC S9(9).
+         88 sql-ok                     VALUE ZERO.
+
+      ******************************************************************
+      *                        FICHIERS EN SORTIE                      *
+      ******************************************************************
+
+
+      *******************************************************
+      *  error messages                                     *
+      *******************************************************
+       01  error-messages.
+      *    ABEND - erreur générales
+           05 err-lines-lacking        PIC X(50)
+             VALUE 'ABEND - Fichier incomplet (20, 25, 28C, 60a).     '.
+           05 err-empty-file           PIC X(50)
+             VALUE 'ABEND - Fichier MT940 vide.                       '.
+           05 err-malformation         PIC X(50)
+             VALUE 'ABEND - format fichier incorrect.                 '.
+           05 err-not-940              PIC X(50)
+             VALUE 'ABEND - Type de transaction erronné :             '.
+           05 err-not-BIC              PIC X(50)
+             VALUE 'ABEND - Numéro BIC incorrect :                    '.
+           05 err-not-IBAN             PIC X(50)
+             VALUE 'ABEND - Numéro IBAN incorrect :                   '.
+           05 err-no-reference         PIC X(50)
+             VALUE 'ABEND - Numéro référence non valide :             '.
+           05 err-statement-number     PIC X(50)
+             VALUE 'ABEND - Numéro de relevé vide ou non numérique :  '.
+           05 err-errors-in-60a        PIC X(50)
+             VALUE 'ABEND - Erreurs dans ligne 60a (solde initial).   '.
+           05 err-invalid-order        PIC X(50)
+             VALUE 'ABEND - Alternance 61 et 86 non respectée.        '.
+           05 err-without-code         PIC X(50)
+             VALUE 'ABEND - Ligne sans code comptable.                '.
+           05 err-no-62                PIC X(50)
+             VALUE 'ABEND - Ligne 62 (solde final), manque.           '.
+           05 err-message-processed    PIC X(50)
+             VALUE 'ABEND - Fichier a déjà été traité.                '.
+           05 err-db-corrupt           PIC X(50)
+             VALUE 'ABEND - DB dans état impropre, sans record avant: '.
+           05 err-balance-DB-different PIC X(50)
+             VALUE 'Solde initial autre que dans DB. Relevé précédent:'.
+           05 err-statem-nb-out-of-line PIC X(50)
+             VALUE 'Relevé précédent pas dans base, fichier en erreur.'.
+           05 err-DB-data-error        PIC X(50)
+             VALUE 'ABEND - Erreur de données dans consultation BD.   '.
+           05 err-amount-61            PIC x(50)
+             VALUE 'ABEND - Erreur montant, solde final non caculable.'.
+           05 err-final-bal            PIC X(50)
+             VALUE 'ABEND - Solde calculé diffère du solde du fichier.'.
+           05 err-errors-in-62         PIC X(50)
+             VALUE 'ABEND - Erreurs dans ligne 62 (solde final).      '.
+      *    Ligne avec erreur de données
+           05 err-D-C-error            PIC X(50)
+             VALUE 'Erreur - Débit / Crédit autre valeur que D ou C : '.
+           05 err-invalid-date         PIC X(50)
+             VALUE 'Erreur - Date invalide :                          '.
+           05 err-amount-not-numeric   PIC X(50)
+             VALUE 'Erreur - Montant non conforme :                   '.
+           05 err-reference-number     PIC X(50)
+             VALUE 'Erreur - Numéro de référence n''est pas valide :  '.
+           05 err-bkcd-inexistant      PIC X(50)
+             VALUE 'Erreur - Code comptable n''est pas valide :       '.
+           05 err-empty-info           PIC X(50)
+             VALUE 'Erreur - Champ informations vide.                 '.
+
+      *******************************************************
+      *  liste d'erreurs                                    *
+      *******************************************************
+       01  err-rec.
+           05 err-line                 PIC X(120).
+      *    headers
+       01  error-header.
+           05 error-header-1.
+              10 FILLER                PIC X(37) value SPACE.
+              10 FILLER                PIC X(47)
+                VALUE 'Liste des erreur pour Relevé de compte bancaire'.
+              10 FILLER                PIC X(36) VALUE SPACE.
+           05 error-header-2.
+              10 FILLER                PIC X(9)
+                                       VALUE 'Langue : '.
+              10 err-language          PIC X.
+              10 FILLER                PIC X(7) VALUE SPACE.
+              10 FILLER                PIC X(13) VALUE 'Numéro BIC : '.
+              10 err-BIC               PIC X(8).
+              10 FILLER                PIC X(7) VALUE SPACE.
+              10 FILLER                PIC X(14) VALUE 'Numéro IBAN : '.
+              10 err-IBAN              PIC X(35).
+              10 FILLER                PIC X(6) VALUE SPACE.
+              10 FILLER                PIC X(17)
+                                       VALUE '  Type message : '.
+              10 err-type-message      PIC XXX.
+           05 error-header-3.
+              10 FILLER                PIC X(40)
+                 VALUE 'ligne, type, no écriture, référence     '.
+              10 FILLER                PIC X(80) VALUE SPACE.
+           05 error-header-end         PIC X(120) VALUE ALL '='.
+      *    ligne pour situations d'ABEND
+       01  abend-rec.
+           05 FILLER                   PIC X(18)
+                                       VALUE 'ABEND sur fichier '.
+           05 abend-fichier            PIC X(10).
+           05 FILLER                   PIC X(16)
+                                       VALUE '  file status : '.
+           05 abend-file-status        PIC XX.
+           05 FILLER                   PIC X(74) VALUE SPACE.
+      *    ligne pour situations d'erreur normales
+       01  error-description.
+           05 err-no-ligne             PIC ZZ9.
+           05 FILLER                   PIC XX VALUE SPACE.
+           05 err-type-ligne           PIC X(3).
+           05 FILLER                   PIC X VALUE SPACE.
+           05 err-nmb-out-line         PIC ZZZZ.
+           05 FILLER                   PIC XX VALUE SPACE.
+           05 err-reference            PIC X(16).
+           05 FILLER                   PIC X VALUE SPACE.
+           05 err-message              PIC X(50).
+           05 FILLER                   PIC X VALUE SPACE.
+           05 err-value.
+              10 err-value-n           PIC -(11)9,99.
+              10 FILLER                PIC X(23).
+      *    ligne pour stocker ligne 61 pour impression en cas d'erreur
+       01  error-61-line               PIC X(120) VALUE SPACE.
+      *    footer
+       01  error-footer.
+           05 error-footer-1           PIC X(120) VALUE ALL '='.
+      *    ligne footer 2 est ligne 1 de la liste de controle
+           05 error-footer-3.
+              10 FILLER                PIC X(47) VALUE ALL '='.
+              10 FILLER                PIC x(27)
+                                    VALUE 'FIN DE LA LISTE DES ERREURS'.
+              10 FILLER                PIC X(46) VALUE ALL '='.
+
+      *******************************************************
+      *  liste de contrôle                                  *
+      *******************************************************
+       01  lst-rec                     PIC X(120).
+      *    headers
+       01  headers.
+           05 header-0.
+              10 FILLER                PIC X(55) VALUE ALL '='.
+              10 FILLER                PIC X(10) VALUE ' BNQ0001R '.
+              10 FILLER                PIC X(55) VALUE ALL '='.
+           05 header-1-1.
+              10 FILLER                PIC X(18)
+                                       VALUE 'EXEMPLE ASSURANCES'.
+              10 FILLER                PIC X(34) VALUE SPACE.
+              10 FILLER                PIC X(17)
+                                      VALUE 'Service comptable'.
+              10 FILLER                PIC X(41) VALUE SPACE.
+              10 header-1-date         PIC X(10).
+           05 header-1-2.
+              10 FILLER                PIC X(47) value SPACE.
+              10 FILLER                PIC X(25)
+                                      VALUE 'Relevé de compte bancaire'.
+              10 FILLER                PIC X(48) VALUE SPACE.
+      *
+           05 header-2-1.
+              10 FILLER                PIC X(9) VALUE 'Banque : '.
+              10 header-2-BIC          PIC X(8).
+              10 FILLER                PIC X(9) VALUE SPACE.
+              10 FILLER                PIC X(19)
+                                       VALUE 'Type transaction : '.
+              10 header-2-msg-type     PIC XXX.
+              10 FILLER                PIC XX VALUE SPACE.
+              10 FILLER                PIC X(19)
+                                       VALUE 'Réf. transaction : '.
+              10 header-2-reference-msg PIC X(16).
+              10 FILLER                PIC XX VALUE SPACE.
+              10 FILLER                PIC X(22)
+                                       VALUE 'Relevé no./ message : '.
+              10 header-2-num-rel-msg  PIC X(11) JUSTIFIED RIGHT.
+           05 header-2-2.
+              10 FILLER                PIC X(9) VALUE 'IBAN   : '.
+              10 header-2-IBAN         PIC X(35).
+              10 FILLER                PIC X(21) VALUE SPACE.
+              10 FILLER                PIC X(18)
+                                       VALUE 'Etat de compte au '.
+              10 header-2-date-bal.
+                 15 header-2-date-bal-dd PIC XX.
+                 15 FILLER             PIC X VALUE '/'.
+                 15 header-2-date-bal-mm PIC XX.
+                 15 FILLER             PIC XXX VALUE '/20'.
+                 15 header-2-date-bal-yy PIC XX.
+              10 FILLER                PIC XXX VALUE ' : '.
+              10 header-2-currency     PIC XXX.
+              10 FILLER                PIC X VALUE SPACE.
+              10 header-2-balance      PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X VALUE SPACE.
+              10 header-2-D-C          PIC X.
+           05 header-2-end             PIC X(120) VALUE ALL '='.
+      *
+           05 header-3-1.
+              10 FILLER                PIC X(45)
+                 VALUE 'No.  St. date val.  date compt.       montant'.
+              10 FILLER                PIC X(47)
+                VALUE '    D/C no. de référence ID comptabilisation'.
+              10 FILLER                PIC X(28)
+                 VALUE '   ID image                 '.
+           05 header-3-2.
+              10 FILLER                PIC X(40)
+                 VALUE 'code compt. libellé                     '.
+              10 FILLER                PIC X(80) VALUE SPACE.
+
+           05 header3-3.
+              10 FILLER                PIC X(12) VALUE 'informations'.
+              10 FILLER                PIC X(108) VALUE SPACE.
+           05 header-3-end             PIC X(120) VALUE ALL '='.
+      *
+       01  headers-table REDEFINES headers.
+           05 header-line              PIC X(120) OCCURS 10.
+       01  num-head                    PIC 99 VALUE 10.
+
+      *    lignes de détail
+       01  detail-lines.
+           05 detail-1.
+              10 detail-nmb-out-line   PIC ZZZ9.
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-err-status     PIC XX.
+              10 FILLER                PIC XX VALUE SPACE.
+              10 detail-val-dat        PIC X(10).
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-bk-dat         PIC X(10).
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-amount         PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-D-C            PIC X.
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-refence        PIC X(16).
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-booking-ID     PIC X(16).
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-image-ID       PIC X(34).
+           05 detail-2.
+              10 detail-booking-code   PIC X(4).
+              10 FILLER                PIC X VALUE SPACE.
+              10 detail-label          PIC X(39).
+              10 FILLER                PIC X(76) VALUE SPACE.
+           05 detail-3-7.
+              10 detail-information.
+                 15 detail-info        PIC X(120) OCCURS 4.
+           05 detail-end               PIC X(120) VALUE ALL '-'.
+       01  num-det                     PIC 9 VALUE 4.
+
+      *    footers
+       01  footers.
+           05 footer-0                 PIC X(120) VALUE ALL '='.
+           05 footer-1.
+              10 FILLER                PIC X(16)
+                                       VALUE 'LU : Nb lignes :'.
+              10 footer-nb-lines       PIC ZZ9.
+              10 FILLER                PIC X(10)
+                                       VALUE ',  Nb 61 :'.
+              10 footer-nb-61          PIC ZZ9.
+              10 FILLER                PIC X(10)
+                                       VALUE ',  Nb 86 :'.
+              10 footer-nb-86          PIC ZZ9.
+              10 FILLER                PIC X(27)
+                                   VALUE '    TRAITE : Nb lignes ok :'.
+              10 footer-nb-processed   PIC ZZ9.
+              10 FILLER                PIC X(24)
+                                       VALUE ',  Nb lignes en erreur :'.
+              10 footer-nb-in-error    PIC ZZ9.
+              10 FILLER                PIC X(15)
+                                       VALUE ',  Nb erreurs :'.
+              10 footer-nb-err         PIC ZZ9.
+           05 footer-2.
+              10 footer-date-bal.
+                 15 footer-date-bal-cc    PIC XX VALUE '20'.
+                 15 footer-date-bal-yy    PIC XX.
+                 15 FILLER                PIC X VALUE '-'.
+                 15 footer-date-bal-mm    PIC XX.
+                 15 FILLER                PIC X VALUE '-'.
+                 15 footer-date-bal-dd    PIC XX.
+              10 FILLER                PIC XX VALUE SPACE.
+              10 FILLER                PIC X(14)
+                                       VALUE 'Total Débit : '.
+              10 footer-total-D        PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X VALUE SPACE.
+              10 FILLER                PIC X(15)
+                                       VALUE 'Total Crédit : '.
+              10 footer-total-C        PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X(42) VALUE SPACE.
+           05 footer-3.
+              10 FILLER                PIC X(26)
+                                     VALUE 'Dont sorti en erreur    : '.
+              10 footer-erreur-D       PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X VALUE SPACE.
+              10 FILLER                PIC X(15)
+                                       VALUE 'Total Crédit : '.
+              10 footer-erreur-C       PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X VALUE SPACE.
+              10 FILLER                PIC X(17)
+                                       VALUE 'Etat du compte : '.
+              10 footer-currency       PIC X(3).
+              10 FILLER                PIC X VALUE SPACE.
+              10 footer-etat-compte    PIC ZZZ.ZZZ.ZZZ.ZZ9,99.
+              10 FILLER                PIC X VALUE SPACE.
+              10 footer-D-C            PIC X.
+           05 footer-end.
+              10 FILLER                PIC X(43) VALUE ALL '='.
+              10 FILLER                PIC X(14)
+                                       VALUE 'fin du relevé '.
+              10 footer-num-rel-msg    PIC X(11) JUSTIFIED RIGHT.
+              10 FILLER                PIC X(54) VALUE ALL '='.
+       01  footers-table REDEFINES footers.
+           05 footer-line              PIC X(120) OCCURS 5.
+       01  num-foot                    PIC 9 VALUE 5.
+
+
+       PROCEDURE DIVISION.
+      ******************************************************************
+      *    paragraphe principal                                        *
+      *    - ouverture des fichiers et inititialisations               *
+      *    - première lecture et traitement du header (blocks 1 à 3) et*
+      *      des lignes générales du block 4 (type 20, 25, 28C et 60a) *
+      *    - premier accès à la BD pour vérifier solde précedent       *
+      *    - lecture des lignes du type 61 et 86 et écriture dans      *
+      *      fichier intermédiaire                                     *
+      *    - lecture de la ligne type 62 pour solde final, vérification*
+      *      de celui-ci et maj du relevé dans BD                      *
+      *    - fermer les fichiers                                       *
+      *                                                                *
+      *    en cas d'erreur grave, l'ABEND se fait par un GO TO         *
+      ******************************************************************
+       0000-MAIN.
+           PERFORM 1000-OPEN-INIT
+           PERFORM 1100-PARAMETERS
+           PERFORM 1300-GET-CURRENT-DATE
+           PERFORM 8000-ERR-LIST-HEAD
+           PERFORM 1200-LOAD-BOOKING-CODES
+      *lecture et traitement des blocks 1-3 et lignes 20 à 60a du 4
+           PERFORM 2200-READ-MT940
+
+      *    si fichier vide :
+           IF mt940-eof
+              GO TO 9000-EMPTY-FILE
+           END-IF
+
+      *    lire les lignes générales
+           PERFORM UNTIL mt940-eof OR code-61 OR code-62
+              PERFORM 0100-PROCESS-GENERAL-LINES
+              PERFORM 2200-READ-MT940
+           END-PERFORM
+
+      *    si des lignes générales manquent :
+           IF NOT (1-ok AND 20-ok AND 25-ok AND 28C-ok AND 60a-ok)
+              GO TO 9100-INCOMPLETE-FILE
+           END-IF
+
+      *    traiter les données générales
+           PERFORM 4000-LECTURE-DB-RELEVE
+           IF releve-ok
+              PERFORM 7500-CHECK-OPENING-BALANCE
+           END-IF
+           PERFORM 6000-OUTFILE-HEADER
+           PERFORM 8500-CONTROL-COMPT-HEADERS
+
+      *lire et traiter les données des écritures
+           PERFORM UNTIL mt940-eof OR code-62
+              PERFORM 0200-PROCESS-DETAIL-LINES
+              PERFORM 2200-READ-MT940
+           END-PERFORM
+      *    si fin de fichier précoce
+           IF mt940-eof
+              GO TO 9200-EARLY-EOF
+           END-IF
+      *
+           PERFORM 7230-PROCESS-62
+      *
+           PERFORM 7600-CHECK-CLOSING-BALANCE
+           PERFORM 6200-OUTFILE-FOOTER
+           PERFORM 8700-CONTROL-COMPT-FOOTER
+           PERFORM 9900-STOP.
+           STOP RUN.
+      *0000-MAIN-END.
+
+      *******************************************************
+      *  traitement principal des information générales     *
+      *******************************************************
+       0100-PROCESS-GENERAL-LINES.
+           EVALUATE ws-940-code
+              WHEN '{1:'
+                 PERFORM 7100-PROCESS-HEADER
+              WHEN ':20'
+                 PERFORM 7110-PROCESS-20
+              WHEN ':25'
+                 PERFORM 7120-PROCESS-25
+              WHEN ':28'
+                 PERFORM 7130-PROCESS-28C
+              WHEN ':60'
+                 PERFORM 7140-PROCESS-60MF
+              WHEN ':86'
+                 MOVE err-invalid-order TO err-message
+                 MOVE SPACE            TO err-value
+                 GO TO 9999-ABEND-8
+              WHEN OTHER
+                 MOVE err-malformation TO err-message
+                 MOVE SPACE            TO err-value
+                 GO TO 9999-ABEND-8
+           END-EVALUATE
+           PERFORM 1020-INIT-ERR-DETAILS
+           .
+      *0100-PROCESS-GENERAL-LINES-END.
+
+      *******************************************************
+      *  traitement principal des lignes détails            *
+      *******************************************************
+       0200-PROCESS-DETAIL-LINES.
+           EVALUATE ws-940-code
+              WHEN ':61'
+                 ADD 1                 TO cnt-out-line
+                 ADD 1                 TO cnt-61
+                 MOVE '61 '            TO err-type-ligne
+                 PERFORM 1050-INIT-WS
+
+      *    ligne précédente doit être 'autre' (pour la 1ère ligne 61
+      *    dans fichier) ou 86
+                 IF previous-other OR previous-86
+                    PERFORM 7210-PROCESS-61
+                 ELSE
+                    GO TO 9300-INVALID-ORDER
+                 END-IF
+                 SET previous-61       TO TRUE
+      *
+              WHEN ':86'
+                 ADD 1                 TO cnt-86
+                 MOVE '86 '            TO err-type-ligne
+
+                 IF previous-61
+                    PERFORM 7220-PROCESS-86
+                    PERFORM 6100-OUTFILE-LINES
+                    PERFORM 8600-CONTROL-COMPT-DETAILS
+                    PERFORM 1020-INIT-ERR-DETAILS
+                 ELSE
+                    GO TO 9300-INVALID-ORDER
+                 END-IF
+                 SET previous-86       TO TRUE
+                 IF NOT record-ok
+                    PERFORM 7900-HANDLE-ERROR-61-86
+                 END-IF
+              END-EVALUATE
+           .
+      *0200-PROCESS-DETAIL-LINES-END.
+
+      ******************************************************************
+      *                  OUVERTURES ET INITIALISATIONS                 *
+      ******************************************************************
+
+       1000-OPEN-INIT.
+           OPEN OUTPUT error-list
+           IF NOT error-ok
+              CLOSE error-list
+              GO TO 9998-ABEND-12
+           END-IF
+
+           OPEN INPUT parameters
+           IF NOT param-ok
+              MOVE 'paramètres'        TO abend-fichier
+              MOVE param-file-status   TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list parameters
+              GO TO  9998-ABEND-12
+           END-IF
+
+           OPEN INPUT mt-940
+           IF NOT mt940-ok
+              MOVE 'mt-940'            TO abend-fichier
+              MOVE mt940-file-status   TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list parameters mt-940
+              GO TO  9998-ABEND-12
+           END-IF
+
+           OPEN INPUT codes-comptables
+           IF NOT codes-comptables-ok
+              MOVE 'cdscompt'              TO abend-fichier
+              MOVE codes-compt-file-status TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list parameters mt-940 codes-comptables
+              GO TO  9998-ABEND-12
+           END-IF
+
+           OPEN OUTPUT out-file
+           IF NOT out-file-ok
+              MOVE 'outfile'           TO abend-fichier
+              MOVE out-file-status     TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list parameters mt-940 codes-comptables
+              CLOSE out-file
+              GO TO  9998-ABEND-12
+           END-IF
+
+           OPEN OUTPUT liste-controle
+           IF NOT controle-ok
+              MOVE 'lstcntrl'          TO abend-fichier
+              MOVE controle-file-status TO abend-file-status
+              PERFORM 8300-ERR-EARLY-ABEND
+              CLOSE error-list parameters mt-940 codes-comptables
+              CLOSE out-file liste-controle
+              GO TO 9998-ABEND-12
+           END-IF
+
+           MOVE SPACE TO err-rec lst-rec
+           PERFORM 1010-INIT-HEADERS
+           PERFORM 1020-INIT-ERR-DETAILS
+           PERFORM 1030-INIT-DETAILS
+           PERFORM 1060-INIT-OUT
+           .
+
+      *********************************************************
+      *    initialisations                                    *
+      *********************************************************
+
+       1010-INIT-HEADERS.
+           INITIALIZE header-1-1 header-2-1 header-2-2
+           .
+
+       1020-INIT-ERR-DETAILS.
+           MOVE SPACE TO error-description
+           .
+
+       1030-INIT-DETAILS.
+           INITIALIZE detail-1 detail-2 detail-3-7
+           .
+
+       1050-INIT-WS.
+           INITIALIZE ws-61
+           SET record-ok            TO TRUE
+           .
+
+       1060-INIT-OUT.
+           INITIALIZE out-header out-footer
+           PERFORM 1070-INIT-OUT-LINE
+           .
+
+       1070-INIT-OUT-LINE.
+           INITIALIZE out-line
+           .
+
+      *********************************************************
+      *    lecture des paramètres                             *
+      *********************************************************
+       1100-PARAMETERS.
+           PERFORM 2000-READ-PARAMS
+           IF param-ok
+              MOVE param-rec           TO param-language
+                                          err-language
+              PERFORM 2000-READ-PARAMS
+           ELSE
+              SET init-ko TO TRUE
+           END-IF
+           IF param-ok
+              MOVE param-rec           TO param-BIC
+                                          err-BIC
+              PERFORM 2000-READ-PARAMS
+           ELSE
+              SET init-ko TO TRUE
+           END-IF
+
+           IF param-ok
+              MOVE param-rec           TO param-IBAN
+                                          err-IBAN
+              PERFORM 2000-READ-PARAMS
+           ELSE
+                 SET init-ko TO TRUE
+           END-IF
+
+           IF param-ok
+              MOVE param-rec           TO param-transaction-type
+                                          err-type-message
+           ELSE
+              SET init-ko TO TRUE
+           END-IF
+
+           IF NOT (english OR german OR french OR italian)
+              SET init-ko TO TRUE
+           END-IF
+
+           IF init-ko
+              MOVE 'params'            TO abend-fichier
+              MOVE param-file-status   TO abend-file-status
+              PERFORM 8000-ERR-LIST-HEAD
+              WRITE error-rec          FROM abend-rec
+              PERFORM 9900-STOP
+              GO TO 9998-ABEND-12
+           END-IF
+           .
+      *1100-PARAMETERS-END.
+
+      **************************************************************
+      *    lecture des codes comptables, alimentation de la table  *
+      **************************************************************
+       1200-LOAD-BOOKING-CODES.
+           PERFORM 2100-READ-CODES
+           PERFORM VARYING idx-bkcd FROM 1 BY 1
+                   UNTIL idx-bkcd  > bkcd-number OR codes-comptables-eof
+              MOVE ws-code-compt-length TO ws-codes-length
+              UNSTRING codes-compt-rec
+                 DELIMITED BY ';'
+                 INTO bkcd-code (idx-bkcd)
+                      bkcd-german (idx-bkcd)
+                      bkcd-english (idx-bkcd)
+                      bkcd-french (idx-bkcd)
+                      bkcd-italian (idx-bkcd)
+
+              PERFORM 2100-READ-CODES
+           END-PERFORM
+           IF cnt-bkcd = 1 THEN
+              MOVE 'cdscompt'              TO abend-fichier
+              MOVE codes-compt-file-status TO abend-file-status
+              WRITE error-rec              FROM abend-rec
+              PERFORM 9900-STOP
+              GO TO  9998-ABEND-12
+           END-IF
+           .
+
+      *******************************************************
+      *    lecture de la date du jour                       *
+      *******************************************************
+       1300-GET-CURRENT-DATE.
+           ACCEPT ws-current-date FROM SYSIN
+           MOVE ws-current-dd           TO ws-current-dd-display
+                                           ws-current-dd-sql
+           MOVE ws-current-mm           TO ws-current-mm-display
+                                           ws-current-mm-sql
+           MOVE ws-current-yyyy         TO ws-current-yyyy-display
+                                           ws-current-yyyy-sql
+           MOVE ws-current-date-display TO header-1-date
+           MOVE ws-current-date-sql     TO out-date
+           .
+
+      ******************************************************************
+      *                          LECTURE                               *
+      ******************************************************************
+       2000-READ-PARAMS.
+           READ parameters
+           .
+
+       2100-READ-CODES.
+           READ codes-comptables
+           ADD 1                       TO cnt-bkcd
+           .
+
+       2200-READ-MT940.
+           READ mt-940
+           NOT AT END
+              MOVE mt-940-rec          TO ws-mt940
+              ADD 1                    TO cnt-lines
+              MOVE cnt-lines           TO err-no-ligne
+           END-READ
+           .
+
+      ******************************************************************
+      *                         ECRITURE                               *
+      ******************************************************************
+       3000-WRITE-ERR-LST.
+           WRITE error-rec             FROM err-line
+           .
+
+       3100-WRITE-RAP-COMPT.
+           WRITE rap-compt-rec         FROM lst-rec
+           MOVE SPACE TO lst-rec
+           .
+
+       3200-WRITE-OUTFILE.
+           EVALUATE out-rec-number
+              WHEN -1
+                 WRITE out-header
+              WHEN 0
+                 WRITE out-footer
+              WHEN OTHER
+                 WRITE out-line
+           END-EVALUATE
+           PERFORM 1070-INIT-OUT-LINE
+           .
+
+      ******************************************************************
+      *                     ACCES A LA BASE DE DONNEES                 *
+      ******************************************************************
+       4000-LECTURE-DB-RELEVE.
+      *    Vérification que message n'a pas déjà été traité
+           PERFORM 5000-SELECT-REFERENCE
+      *    Si trouvé: fichier déjà traité
+           IF SQLCODE = 0
+              MOVE err-message-processed TO err-message
+              MOVE ws-20-reference       TO err-value
+              GO TO 9999-ABEND-8
+           END-IF
+
+      *    Chercher message précédent par numéro de relevé
+      *    Statement number recommence à 1 chaque année
+           IF ws-statement-number = 1
+              COMPUTE ws-year-statement = 1000 * (ws-current-yyyy - 1)
+                                          + 999
+           ELSE
+              COMPUTE ws-year-statement = 1000 * ws-current-yyyy
+                                          + ws-statement-number
+           END-IF
+           PERFORM 5100-SELECT-STATEMENT-NUMBER
+           IF SQLCODE NOT = 0
+              MOVE SQLCODE             TO ws-sqlcode
+              MOVE err-db-corrupt      TO err-message
+              MOVE ws-year-statement   TO ws-y-s-n
+              STRING ' ' ws-yyyy-statement ' ' ws-number-statement
+               ' sqlcode=' ws-sqlcode  DELIMITED BY SIZE INTO err-value
+              GO TO 9999-ABEND-8
+
+           ELSE
+      *    Si relevé précédent trouvé n'est pas le relevé directement
+      *    antérieur au présent, alors à signaler et mettre en erreur
+      *    le fichier en entier pour qu'il ne soit pas traité
+      *    automatiquement dans la comptabilisation ultérieure.
+      *    Exception: premier relevé de l'année, où l'on ne peut pas
+      *    déterminer si le précédent est le dernier de l'année.
+      *    Une absence du dernier relevé occasionnera une erreur sur le
+      *    solde précédent (sauf s'il n'y a pas eu de mouvements).
+              COMPUTE ws-year-statement-1 = ws-year-statement - 1
+              IF ws-year-statement-1 NOT = rlv-numreleve AND
+                 ws-statement-number > 1 THEN
+                 MOVE err-statem-nb-out-of-line TO err-message
+                 MOVE SPACE               TO err-value
+                 SET releve-ko            TO TRUE
+                 PERFORM 8100-ERR-DETAILS
+              ELSE
+      *    si null value dans solde final
+                 IF rlv-soldefin-ind NOT = 0 THEN
+                    MOVE err-DB-data-error TO err-message
+                    MOVE 'Solde final'     TO err-value
+                    GO TO 9999-ABEND-8
+                 END-IF
+              END-IF
+           END-IF
+           .
+
+      ******************************************************
+      *    chercher relevé par no de référence             *
+      ******************************************************
+       5000-SELECT-REFERENCE.
+           EXEC SQL OPEN CURSOR-RELEVE-1 END-EXEC.
+           EXEC SQL FETCH CURSOR-RELEVE-1 INTO
+                          :rlv-refmssg:rlv-refmssg-ind
+           END-EXEC
+           .
+
+      ******************************************************
+      *    chercher relevé précédent dans base             *
+      ******************************************************
+       5100-SELECT-STATEMENT-NUMBER.
+           EXEC SQL OPEN CURSOR-RELEVE-2 END-EXEC.
+           EXEC SQL FETCH CURSOR-RELEVE-2 INTO
+                          :rlv-BIC:rlv-BIC-ind,
+                          :rlv-IBAN:rlv-IBAN-ind,
+                          :rlv-numreleve:rlv-numreleve-ind,
+                          :rlv-soldefin:rlv-soldefin-ind
+           END-EXEC
+           .
+
+      ******************************************************************
+      *           PREPARATION ET ECRITURE FICHIER EN SORTIE            *
+      ******************************************************************
+       6000-OUTFILE-HEADER.
+           IF releve-ok
+              MOVE 'T'                 TO out-file-error-status
+           ELSE
+              MOVE 'E'                 TO out-file-error-status
+           END-IF
+           MOVE -1                     TO out-rec-number
+           PERFORM 3200-WRITE-OUTFILE
+           .
+      *
+       6100-OUTFILE-LINES.
+           IF record-ok
+              MOVE 'T'                 TO out-error-status
+              MOVE 'OK'                TO detail-err-status
+              ADD 1                    TO cnt-processed
+           ELSE
+              MOVE 'E'                 TO out-error-status
+              MOVE 'ER'                TO detail-err-status
+              ADD 1                    TO cnt-in-error
+           END-IF
+
+           MOVE cnt-out-line           TO out-rec-number
+           PERFORM 3200-WRITE-OUTFILE
+           .
+      *
+       6200-OUTFILE-FOOTER.
+           MOVE cnt-in-error           TO out-number-in-error
+           MOVE cnt-processed          TO out-number-processed
+           MOVE 0                      TO out-rec-number
+           PERFORM 3200-WRITE-OUTFILE
+           .
+
+      ******************************************************************
+      *                   TRAITEMENTS DES DONNEES                       *
+      ******************************************************************
+
+      *******************************************************
+      *  traitements : partie générale du fichier mt940     *
+      *******************************************************
+      *-----------------------------------------------------*
+      * -- traiter première ligne du fichier MT940, entête --
+      *-----------------------------------------------------*
+       7100-PROCESS-HEADER.
+           ADD 1                       TO nb-1
+           MOVE '1  '                  TO err-type-ligne
+
+      *    trouver début du block 1
+           MOVE 2 TO begin
+           PERFORM VARYING point FROM 2 by 1
+                                       UNTIL ws-mt940 (point : 1) = ':'
+                                       OR point > 4
+           END-PERFORM
+
+      *    1!a 2!n puis LTAddress (12!x), dont le BIC (8!x)
+           COMPUTE begin = point + 1 + 3
+           MOVE 8 TO lngth
+           PERFORM 7710-VALIDATE-BIC-ABEND
+           MOVE ws-mt940 (begin : lngth) TO ws-1-BIC
+                                            out-BIC
+                                            header-2-BIC
+
+      *    trouver début du block 2
+           COMPUTE begin = begin + lngth
+           PERFORM VARYING point FROM begin by 1
+                                       UNTIL ws-mt940 (point : 1) = ':'
+                                       OR point > 35
+           END-PERFORM
+
+      *    1!a puis type de transaction
+           COMPUTE begin = point + 1 + 1
+           MOVE 3 TO lngth
+           PERFORM 7720-VALIDATE-TYPE-ABEND
+           MOVE ws-mt940 (begin:lngth) TO out-type-message
+                                          header-2-msg-type
+
+      *    on saute block 3, block 4 commence par :20:
+           .
+      *7100-PROCESS-HEADER-END.
+
+      *-----------------------------------------------------*
+      * -- traiter ligne :20: transaction reference number--
+      *-----------------------------------------------------*
+       7110-PROCESS-20.
+           ADD 1                       TO nb-20
+           MOVE '20 '                  TO err-type-ligne
+           PERFORM 7740-VALIDATE-REFERENCE-ABEND
+           MOVE ws-mt940 (5:16)        TO ws-20-reference
+                                          out-reference-message
+                                          header-2-reference-msg
+           .
+
+      *-----------------------------------------------------*
+      * -- traiter ligne :25: account identification (IBAN) --
+      *-----------------------------------------------------*
+       7120-PROCESS-25.
+           ADD 1                       TO nb-25
+           MOVE '25 '                  TO err-type-ligne
+           PERFORM 7730-VALIDATE-IBAN-ABEND
+           MOVE ws-mt940 (5 :35)       TO ws-25-IBAN
+                                          out-IBAN
+                                          header-2-IBAN
+           .
+
+      *-----------------------------------------------------*
+      * -- traiter ligne :28C: Statement number/Sequence number--
+      *-----------------------------------------------------*
+       7130-PROCESS-28C.
+           ADD 1                       TO nb-28C
+           MOVE '28C'                  TO err-type-ligne
+           MOVE FUNCTION TRIM (ws-mt940 (6:11) TRAILING) TO
+                                               ws-28-statement-number
+                                               header-2-num-rel-msg
+                                               footer-num-rel-msg
+           PERFORM VARYING point FROM 1 BY 1
+                UNTIL point > 5 OR ws-28-statement-number(point:1) = '/'
+           END-PERFORM
+           COMPUTE lngth = point - 1
+
+           PERFORM 7750-VALIDATE-ST-NUMBER-ABEND
+
+           MOVE ws-28-statement-number (1:lngth)
+                                       TO out-statement-number
+                                          ws-statement-number
+           .
+
+      *-----------------------------------------------------*
+      * -- traiter ligne :60a: Opening balance--
+      *-----------------------------------------------------*
+       7140-PROCESS-60MF.
+           ADD 1                       TO nb-60a
+           MOVE '60a'                  TO err-type-ligne
+      *    débit/crédit 1!a
+           MOVE ws-mt940 (6:1)         TO header-2-D-C
+                                          ws-D-C
+                                          out-D-C-init
+           PERFORM 7760-VALIDATE-D-C-ERROR
+      *    date 6!a
+           MOVE ws-mt940 (7:2)         TO ws-60-date-yy
+                                          header-2-date-bal-yy
+                                          ws-yy
+           MOVE ws-mt940 (9:2)         TO ws-60-date-mm
+                                          header-2-date-bal-mm
+                                          ws-mm
+           MOVE ws-mt940 (11:2)        TO ws-60-date-dd
+                                          header-2-date-bal-dd
+                                          ws-dd
+           PERFORM 7770-VALIDATE-DATE-ERROR
+
+      *    monnaie 3!a
+           MOVE ws-mt940 (13:3)        TO out-currency
+                                          header-2-currency
+
+      *    montant 16n: 0 à 2 décimales après la virgule
+           MOVE 16 TO begin
+           PERFORM 7300-PROCESS-AMOUNTS
+           IF amount-ko THEN
+              SET record-ko-general    TO TRUE
+           ELSE
+              MOVE amount-n            TO    header-2-balance
+                                             ws-balance
+                                             out-balance-init
+              IF ws-D-C = "D" THEN
+                 COMPUTE ws-balance = ws-balance * -1
+              END-IF
+              MOVE ws-balance          TO ws-60-opening-bal
+           END-IF
+      *
+           IF NOT record-ok THEN
+              MOVE err-errors-in-60a   TO err-message
+              MOVE 'voir erreur précédente' TO err-value
+              PERFORM 9990-CORRECT-ABEND-AFTER-ERROR
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+      *7140-PROCESS-60MF-END
+
+      **************************************************************
+      *  traitements : lignes détail du fichier mt940              *
+      **************************************************************
+      *-----------------------------------------------------*
+      * -- traiter ligne :61: Statement line--
+      *-----------------------------------------------------*
+       7210-PROCESS-61.
+      *    pour en cas d'erreurs:
+           move ws-mt940               TO error-61-line
+      *    date valeur 6!n
+           MOVE 20                     TO ws-61-val-date-cc
+                                          ws-61-ent-date-cc
+                                          ws-cc
+                                          ws-cc-10
+           MOVE ws-mt940 (5:2)         TO ws-61-val-date-yy
+                                          ws-61-ent-date-yy
+                                          ws-yy
+                                          ws-yy-10
+           MOVE ws-mt940 (7:2)         TO ws-61-val-date-mm
+                                          ws-mm
+                                          ws-mm-10
+           MOVE ws-mt940 (9:2)         TO ws-61-val-date-dd
+                                          ws-dd
+                                          ws-dd-10
+      *    change date si pas une date:
+           PERFORM 7770-VALIDATE-DATE-ERROR
+           MOVE ws-date-10             TO detail-val-dat
+                                          out-val-date
+
+      *    date comptable 4!n
+           MOVE ws-mt940 (11:2)        TO ws-61-ent-date-mm
+                                          ws-mm
+                                          ws-mm-10
+           MOVE ws-mt940 (13:2)        TO ws-61-ent-date-dd
+                                          ws-dd
+                                          ws-dd-10
+           PERFORM 7770-VALIDATE-DATE-ERROR
+      *    adapter l'année comptable si date comptable après date du
+      *    solde
+           IF record-ok THEN
+              COMPUTE ws-date-comp-1 =
+                                   FUNCTION INTEGER-OF-DATE (ws-date-n)
+              COMPUTE ws-date-comp-2 =
+                          FUNCTION INTEGER-OF-DATE (ws-current-yyyymmdd)
+              IF ws-date-comp-1 > ws-date-comp-2 THEN
+                 SUBTRACT 1 from ws-61-ent-date-yy-n
+              END-IF
+           ELSE
+              MOVE ws-date-zero        TO ws-61-entry-date
+           END-IF
+           MOVE ws-61-entry-date       TO out-ent-date
+                                          detail-bk-dat
+
+      *    débit / crédit 2a (on n'en exploite que la première position)
+           MOVE ws-mt940 (15:1)        TO out-D-C-detail
+                                          detail-D-C
+                                          ws-D-C
+                                          ws-61-D-C
+           PERFORM 7760-VALIDATE-D-C-ERROR
+           IF record-ko-general THEN
+              PERFORM 9990-CORRECT-ABEND-AFTER-ERROR
+              MOVE err-amount-61       TO err-message
+              MOVE SPACE               TO err-value
+              GO TO 9999-ABEND-8
+           END-IF
+
+      *    funds code, probablement absent (1!a), chercher numérique.
+      *    montant
+           PERFORM VARYING point FROM 16 BY 1
+                                 UNTIL ws-mt940 (point:1) IS NUMERIC OR
+                                 ws-mt940(point:1) = ','
+                                 OR point > 18
+           END-PERFORM
+
+      *    16d. Le montant est ajouté au solde même si des erreurs ont
+      *    déjà été constatées dans le 61. Ceci afin de pouvoir vérifier
+      *    le solde final (sauf si D/C erronné, alors abend plus tard)
+           MOVE point                  TO begin
+           PERFORM 7300-PROCESS-AMOUNTS
+           IF amount-ok
+              MOVE amount-n            TO out-amount
+                                          detail-amount
+                                          ws-61-amount
+              IF ws-D-C = "D"
+                 ADD amount-n          TO ws-cumul-D
+              END-IF
+              IF ws-D-C = "C"
+                 ADD amount-n          TO ws-cumul-C
+              END-IF
+           ELSE
+              PERFORM 9990-CORRECT-ABEND-AFTER-ERROR
+              MOVE err-amount-61       TO err-message
+              MOVE SPACE               TO err-value
+              GO TO 9999-ABEND-8
+           END-IF
+
+      *    1!a3!c puis numéro de référence
+      *    point est sur dernière position du montant
+           COMPUTE begin = point + 1 + 4
+           PERFORM VARYING point FROM begin BY 1
+                                 UNTIL ws-mt940 (point:2) = '//' OR
+                                       (point - begin) = 16
+           END-PERFORM
+           COMPUTE lngth = point - begin
+           MOVE ws-mt940 (begin:lngth) TO out-reference
+                                          detail-refence
+                                          err-reference
+           PERFORM 7780-VALIDATE-REF-NUMB-ERROR
+      *    [//16x] ID de comptabilisation (peut être absent)
+      *    point est soit sur // soit sur le champ suivant si ID absent
+           IF ws-mt940 (point:2) = '//'
+              ADD 2                    TO point
+              MOVE ws-mt940 (point:16) TO out-booking-id
+                                          detail-booking-ID
+              ADD 16                   TO point
+           END-IF
+      *    34x ID image
+           MOVE ws-mt940 (point:34)    TO out-image-ID
+                                          detail-image-ID
+           .
+      *7210-PROCESS-61-END.
+
+      *-----------------------------------------------------*
+      * -- traiter ligne :86: Information to account owner--
+      *-----------------------------------------------------*
+       7220-PROCESS-86.
+      *    4!n code comptable
+      *    Puis, normalement 3!a (?61) puis information: 6 * 65 moins
+      *    moins les 7 positions du code comptable et ?61.
+
+           PERFORM 7790-VALIDATE-BKCD-ABEND
+
+           MOVE ws-mt940 (5:4)      TO out-booking-code
+                                          detail-booking-code
+      *    chercher le libellé du code comptable dans la table
+           SEARCH ALL bkcd-rec
+           AT END
+              MOVE err-bkcd-inexistant TO err-message
+              MOVE out-booking-code  TO err-value
+              PERFORM 8100-ERR-DETAILS
+              SET record-ko-partial    TO TRUE
+           WHEN bkcd-code (idx-bkcd) = out-booking-code
+              EVALUATE param-language
+                 WHEN 'G'
+                    MOVE bkcd-german (idx-bkcd)(1:39) TO detail-label
+                 WHEN 'E'
+                    MOVE bkcd-english (idx-bkcd)(1:39) TO detail-label
+                 WHEN 'F'
+                    MOVE bkcd-french (idx-bkcd)(1:39) TO detail-label
+                 WHEN 'I'
+                    MOVE bkcd-italian (idx-bkcd)(1:39) TO detail-label
+              END-EVALUATE
+           END-SEARCH
+
+           PERFORM 7800-VALIDATE-INFO-ERROR
+
+           MOVE ws-mt940 (12:383)      TO out-info
+                                          detail-information
+           .
+      *7220-PROCESS-86-END.
+
+      *******************************************************
+      *  traitements: lignes de fin du MT940                *
+      *******************************************************
+      *-----------------------------------------------------*
+      * -- traiter ligne :62: Closing balance--
+      *-----------------------------------------------------*
+       7230-PROCESS-62.
+           MOVE ZERO                   TO cnt-out-line
+           SET record-ok               TO TRUE
+      *    débit/crédit 1!a
+           MOVE ws-mt940 (6:1)         TO footer-D-C
+                                          out-D-C-final
+                                          ws-D-C
+           PERFORM 7760-VALIDATE-D-C-ERROR
+
+      *    date 6!a
+           MOVE ws-mt940 (7:2)         TO ws-62-date-yy
+                                          footer-date-bal-yy
+                                          ws-yy
+           MOVE ws-mt940 (9:2)         TO ws-62-date-mm
+                                          footer-date-bal-mm
+                                          ws-mm
+           MOVE ws-mt940 (11:2)        TO ws-62-date-dd
+                                          footer-date-bal-dd
+                                          ws-dd
+           PERFORM 7770-VALIDATE-DATE-ERROR
+           MOVE ws-62-date             TO out-date-file
+
+      *    monnaie 3!a
+           MOVE ws-mt940 (13:3)        TO footer-currency
+
+      *    montant 16n: 0 à 2 décimales après la virgule
+           MOVE 16 TO begin
+           PERFORM 7300-PROCESS-AMOUNTS
+           IF amount-ok
+              MOVE amount-n            TO footer-etat-compte
+                                          out-balance
+           ELSE
+               SET record-ko-general   TO TRUE
+           END-IF
+
+           IF NOT record-ok THEN
+              MOVE err-errors-in-62    TO err-message
+              MOVE 'Voir erreur précédente' TO err-value
+              PERFORM 9990-CORRECT-ABEND-AFTER-ERROR
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+      *7230-PROCESS-62-END.
+
+      *********************************************************
+      *  décortique un montant.                               *
+      *    Pour invoquer:                                     *
+      *    - mettre begin à la première position du montant   *
+      *    Retourne (remplit):                                *
+      *    - amount-n                                         *
+      *    - point reste sur dernière position du montant     *
+      *********************************************************
+       7300-PROCESS-AMOUNTS.
+      *    positionner le curseur pour identifier la virgule
+           PERFORM VARYING point FROM begin by 1
+                   UNTIL ws-mt940 (point : 1) = ','
+                   OR point > begin + 16
+           END-PERFORM
+      *    trouver les chiffres avant la virgule
+           COMPUTE lngth = point - begin
+           IF lngth > 0
+              IF ws-mt940 (begin:lngth) IS NUMERIC
+                 MOVE ws-mt940 (begin:lngth) TO amount-floor
+              ELSE
+                 MOVE err-amount-not-numeric TO err-message
+                 MOVE ws-mt940 (begin:lngth) TO err-value
+                 PERFORM 8100-ERR-DETAILS
+                 SET amount-ko to TRUE
+              END-IF
+           ELSE
+              MOVE 0                      TO amount-floor
+           END-IF
+           IF NOT amount-ko
+      *    trouver les chiffres après la virgule
+              IF ws-mt940 (point + 1 : 1) IS NUMERIC
+                 ADD 1                   TO point
+                 MOVE ws-mt940 (point:1) TO amount-decimals
+                 COMPUTE amount-decimals = amount-decimals * 10
+                 IF ws-mt940 (point + 1 : 1) IS NUMERIC
+                    ADD 1                TO point
+                    MOVE ws-mt940 (point: 1) TO amount-decimals-2
+                    ADD amount-decimals-2 TO amount-decimals
+                 END-IF
+              ELSE
+                 MOVE 0                   TO amount-decimals
+              END-IF
+           END-IF
+           .
+      *7300-PROCESS-AMOUNTS-END.
+
+      ******************************************************************
+      *                     VALIDATIONS                                *
+      *                                                                *
+      * Validation des données, impression de messages d'erreur        *
+      * et mise de switchs pour exclure de traitement ultérieur        *
+      * les lignes contant des problèmes                               *
+      ******************************************************************
+
+      *************************************************
+      *  validation du solde initial                  *
+      *************************************************
+       7500-CHECK-OPENING-BALANCE.
+      *    vérifier que dernier solde identique dans fichier et BD
+      *    une différence peut être le résultat d'un relevé pas traité
+      *    et donc absent de la base.
+           IF rlv-soldefin NOT = ws-60-opening-bal
+              MOVE rlv-soldefin        TO ws-amount
+              MOVE ws-year-statement   TO ws-y-s-n
+              MOVE err-balance-DB-different TO err-message
+              STRING ' ' ws-yyyy-statement ' ' ws-number-statement
+                ', solde: ' ws-amount-x DELIMITED BY SIZE INTO err-value
+              SET releve-ko            TO TRUE
+              PERFORM 8100-ERR-DETAILS
+           END-IF
+           .
+
+      ***********************************************
+      *  validation du solde final                  *
+      ***********************************************
+       7600-CHECK-CLOSING-BALANCE.
+      *    vérifier que solde final calculé est égal au solde final
+      *    du fichier
+           COMPUTE ws-balance = ws-balance + ws-cumul-C - ws-cumul-D
+           IF out-balance  NOT = ws-balance
+              SET record-ko-general    TO TRUE
+              MOVE err-final-bal       TO err-message
+              MOVE ws-balance          TO err-value-n
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      ***********************************************
+      *  validation du BIC. ABEND en cas d'erreur   *
+      ***********************************************
+       7710-VALIDATE-BIC-ABEND.
+           IF ws-mt940 (begin : lngth) NOT = param-BIC
+              MOVE ws-mt940 (begin:lngth) TO err-value
+              MOVE err-not-BIC            TO err-message
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      *********************************************************
+      *  validation du type de message. ABEND en cas d'erreur *
+      *********************************************************
+       7720-VALIDATE-TYPE-ABEND.
+           IF ws-mt940 (begin:lngth) NOT = param-transaction-type
+              MOVE ws-mt940 (begin:lngth) TO err-value
+              MOVE err-not-940            TO err-message
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      ************************************************
+      *  validation de l'IBAN. ABEND en cas d'erreur *
+      ************************************************
+       7730-VALIDATE-IBAN-ABEND.
+           IF ws-mt940 (5:35) NOT = param-IBAN
+              MOVE ws-mt940 (5:35)     TO err-value
+              MOVE err-not-IBAN        TO err-message
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      *************************************************************
+      *  validation du numéro de référence. ABEND en cas d'erreur *
+      *************************************************************
+       7740-VALIDATE-REFERENCE-ABEND.
+           IF ws-mt940 (5:16) = SPACE OR ws-mt940 (5:16) = ALL 'X' OR
+              ws-mt940 (5:16) = ALL '0' THEN
+              MOVE ws-mt940 (5:16)     TO err-value
+              MOVE err-no-reference    TO err-message
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      **********************************************************
+      *  validation du numéro de relevé. ABEND en cas d'erreur *
+      **********************************************************
+       7750-VALIDATE-ST-NUMBER-ABEND.
+           IF lngth = 0 OR ws-28-statement-number (1:lngth) NOT NUMERIC
+              MOVE err-statement-number TO err-message
+              MOVE ws-28-statement-number (1:lngth) TO err-value
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      ********************************************************
+      *  validation du débit /crédit. Erreur en cas d'erreur *
+      ********************************************************
+       7760-VALIDATE-D-C-ERROR.
+           IF ws-D-C NOT = 'D' AND ws-D-C NOT = 'C' THEN
+              MOVE ws-D-C              TO err-value
+              MOVE err-D-C-error       TO err-message
+              PERFORM 8100-ERR-DETAILS
+              SET record-ko-general    TO TRUE
+           END-IF
+           .
+
+      **************************************************
+      *  validation d'une date. Erreur en cas d'erreur *
+      **************************************************
+       7770-VALIDATE-DATE-ERROR.
+           MOVE 20                     TO ws-cc
+           IF FUNCTION TEST-DATE-YYYYMMDD (ws-date-n) > 0 THEN
+              MOVE err-invalid-date    TO err-message
+              MOVE ws-date             TO err-value
+              PERFORM 8100-ERR-DETAILS
+              SET record-ko-partial    TO TRUE
+              MOVE ws-date-zero        TO ws-date-10
+           END-IF
+           .
+
+      **************************************************************
+      *  validation du numéro de référence. Erreur en cas d'erreur *
+      **************************************************************
+       7780-VALIDATE-REF-NUMB-ERROR.
+           IF out-reference = SPACE OR out-reference = ZEROES THEN
+              MOVE err-reference-number TO err-message
+              MOVE out-reference      TO err-value
+              PERFORM 8100-ERR-DETAILS
+              SET record-ko-partial   TO TRUE
+           .
+
+      ****************************************************
+      *  validation de la présence d'un code comptable.  *
+      *  ABEND en cas d'erreur                           *
+      ****************************************************
+       7790-VALIDATE-BKCD-ABEND.
+           IF ws-mt940 (9:3) NOT = '?61' THEN
+              MOVE err-without-code       TO err-message
+              MOVE SPACE                  TO err-value
+              GO TO 9999-ABEND-8
+           END-IF
+           .
+
+      *************************************************
+      *  validation des infos. Erreur en cas d'erreur *
+      *************************************************
+       7800-VALIDATE-INFO-ERROR.
+           IF ws-mt940 (12:383) = SPACE
+              MOVE err-empty-info      TO err-message
+              PERFORM 8100-ERR-DETAILS
+              SET record-ko-partial    TO TRUE
+           END-IF
+           .
+
+      ***********************************************
+      *  Gérér erreur sur montant. ABEND            *
+      ***********************************************
+       7900-HANDLE-ERROR-61-86.
+      *    Si erreur C/D ou montant, alors ABEND
+           IF ws-61-D-C = 'D' THEN
+              ADD ws-61-amount        TO ws-cumul-err-D
+           ELSE
+              ADD ws-61-amount        TO ws-cumul-err-C
+           END-IF
+           PERFORM 8150-ERR-DETAILS-EXTRA
+           .
+
+      ******************************************************************
+      *                     IMPRESSION DES LISTES                      *
+      ******************************************************************
+      * ************************************************
+      *    liste d'erreurs                             *
+      **************************************************
+       8000-ERR-LIST-HEAD.
+           MOVE header-0               TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE header-1-1             TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-header-1         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-header-2         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-header-3         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE header-2-end           TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           .
+
+       8100-ERR-DETAILS.
+           ADD 1                       TO cnt-errors
+           MOVE cnt-out-line           TO err-nmb-out-line
+           MOVE error-description      TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           PERFORM 1020-INIT-ERR-DETAILS
+           MOVE 4                      TO RETURN-CODE
+           .
+
+       8150-ERR-DETAILS-EXTRA.
+           MOVE error-61-line          TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           PERFORM 1020-INIT-ERR-DETAILS
+           .
+
+       8200-ERR-FOOTER.
+           MOVE cnt-lines              TO footer-nb-lines
+           MOVE cnt-61                 TO footer-nb-61
+           MOVE cnt-86                 TO footer-nb-86
+           MOVE cnt-processed          TO footer-nb-processed
+           MOVE cnt-in-error           TO footer-nb-in-error
+           MOVE cnt-errors             TO footer-nb-err
+
+           MOVE error-footer-1         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE footer-1               TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           MOVE error-footer-3         TO err-line
+           PERFORM 3000-WRITE-ERR-LST
+           .
+
+       8300-ERR-EARLY-ABEND.
+           PERFORM 8000-ERR-LIST-HEAD
+           WRITE error-rec FROM abend-rec
+           PERFORM 8200-ERR-FOOTER
+           .
+
+      ****************************************************
+      *    liste de contrôle                             *
+      ****************************************************
+       8500-CONTROL-COMPT-HEADERS.
+           PERFORM VARYING cnt FROM 1 BY 1 UNTIL cnt > num-head
+              MOVE header-line (cnt) TO lst-rec
+              PERFORM 3100-WRITE-RAP-COMPT
+           END-PERFORM
+           .
+
+       8600-CONTROL-COMPT-DETAILS.
+           MOVE cnt-out-line           TO detail-nmb-out-line
+           MOVE detail-1               TO lst-rec
+           PERFORM 3100-WRITE-RAP-COMPT
+
+           MOVE detail-2               TO lst-rec
+           PERFORM 3100-WRITE-RAP-COMPT
+
+           PERFORM VARYING cnt FROM 1 BY 1
+                   UNTIL cnt > num-det OR detail-info(cnt) = SPACE
+              MOVE detail-info (cnt) TO lst-rec
+              PERFORM 3100-WRITE-RAP-COMPT
+           END-PERFORM
+
+           MOVE detail-end             TO lst-rec
+           PERFORM 3100-WRITE-RAP-COMPT
+           PERFORM 1030-INIT-DETAILS
+           .
+      *
+       8700-CONTROL-COMPT-FOOTER.
+           MOVE cnt-lines              TO footer-nb-lines
+           MOVE cnt-61                 TO footer-nb-61
+           MOVE cnt-86                 TO footer-nb-86
+           MOVE cnt-processed          TO footer-nb-processed
+           MOVE cnt-in-error           TO footer-nb-in-error
+           MOVE cnt-errors             TO footer-nb-err
+           MOVE ws-cumul-D             TO footer-total-D
+           MOVE ws-cumul-C             TO footer-total-C
+           MOVE ws-cumul-err-D         TO footer-erreur-D
+           MOVE ws-cumul-err-C         TO footer-erreur-C
+
+           PERFORM VARYING cnt FROM 1 BY 1 UNTIL cnt > num-foot
+              MOVE footer-line(cnt)  TO lst-rec
+              PERFORM 3100-WRITE-RAP-COMPT
+           END-PERFORM
+           .
+      ******************************************************************
+      *            GERER CERTAINES SITUATIONS D'ABEND                  *
+      ******************************************************************
+       9000-EMPTY-FILE.
+           MOVE err-empty-file         TO err-message
+           MOVE SPACE                  TO err-value
+           PERFORM 8100-ERR-DETAILS
+           PERFORM 9900-STOP
+           GO TO  9998-ABEND-12
+           .
+
+       9100-INCOMPLETE-FILE.
+           MOVE err-lines-lacking      TO err-message
+           MOVE SPACE                  TO err-value
+           GO TO 9999-ABEND-8
+           .
+
+       9200-EARLY-EOF.
+           MOVE err-no-62              TO err-message
+           MOVE SPACE                  TO err-value
+           GO TO 9999-ABEND-8
+           .
+
+       9300-INVALID-ORDER.
+           MOVE err-invalid-order      TO err-message
+           MOVE SPACE                  TO err-value
+           GO TO 9999-ABEND-8
+           .
+
+      ******************************************************************
+      *         TERMINER LES LISTES, FERMER LES FICHIERS               *
+      ******************************************************************
+       9900-STOP.
+           CLOSE liste-controle
+           CLOSE codes-comptables
+           CLOSE mt-940
+
+           CLOSE out-file
+           IF NOT out-file-ok
+              MOVE 'outfile'           TO abend-fichier
+              MOVE out-file-status     TO abend-file-status
+              WRITE error-rec          FROM abend-rec
+              PERFORM 8200-ERR-FOOTER
+              CLOSE error-list
+              GO TO 9998-ABEND-12
+           END-IF
+
+           PERFORM 8200-ERR-FOOTER
+           CLOSE error-list
+           .
+
+      ******************************************************************
+      *                             ABEND                              *
+      ******************************************************************
+       9990-CORRECT-ABEND-AFTER-ERROR.
+      * -- nécessaire en cas d'un ABEND après écriture d'une erreur
+      *    sur liste. Sans cela, le nombre d'erreurs rapporté serait
+      *    incorrect.
+           SUBTRACT 1                  FROM cnt-errors
+           .
+
+       9998-ABEND-12.
+           MOVE 12 TO RETURN-CODE
+           STOP RUN
+           .
+
+       9999-ABEND-8.
+           PERFORM 8100-ERR-DETAILS
+           PERFORM 9900-STOP
+           MOVE 8 TO RETURN-CODE
+           STOP RUN
+           .
